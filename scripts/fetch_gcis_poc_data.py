@@ -8,7 +8,9 @@ industry/capital/age/cluster, and export structured JSON for the 3D PoC.
 from __future__ import annotations
 
 import bisect
+import csv
 import hashlib
+import io
 import json
 import random
 import re
@@ -19,6 +21,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -33,6 +36,18 @@ INDEX_HTML = WORKSPACE / "index.html"
 OID_CAPITAL = "F0E8FB8D-E2FD-472E-886C-91C673641F31"
 OID_KEYWORD = "6BBA2268-1367-4B42-9CCA-BC17499EBE8C"
 OID_BAN = "5F64D864-61CB-4D0D-8AD9-492047CC1EA6"
+
+# Official MOEA / GCIS bulk Open Data datasets for Central Taiwan manufacturing & active factories
+OID_TAICHUNG_COMP_CMFG = "FC420109-8DF7-49F8-BD9F-BBB34289E7BD"
+OID_CENTRAL_COMP_CMFG = "0D84DBC0-962E-48E7-9BE1-21549F0F38EB"
+OID_TAICHUNG_BIZ_CMFG = "64F185DC-F414-4898-B3B2-7022B57A83E2"
+IDA_FACTORY_INDEX_CSV = "https://www.ida.gov.tw/opendata/02/SDD6569.csv"
+IDA_FACTORY_ZIP_FALLBACK = "https://serv.gcis.nat.gov.tw/RDownLoad/Data/statistical/%E7%94%9F%E7%94%A2%E4%B8%AD%E5%B7%A5%E5%BB%A0%E6%B8%85%E5%86%8A.zip"
+
+CENTRAL_COUNTIES = {"臺中市", "彰化縣", "南投縣", "苗栗縣", "雲林縣"}
+METAL_ELEC_MACH_2D = {"24", "25", "28", "29", "30", "31"}
+TRAD_MFG_2D = {"08", "09", "10", "11", "12", "13", "14", "15", "16", "18", "19", "21", "22", "23", "32", "33"}
+TARGET_CENTRAL_MFG_2D = METAL_ELEC_MACH_2D | TRAD_MFG_2D
 
 # Live TWSE & TPEx OpenAPI endpoints
 TWSE_INFO_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
@@ -169,18 +184,80 @@ DISTRICT_ANCHORS: dict[str, tuple[float, float, float]] = {
     "新豐鄉": (120.985, 24.899, 0.015),
     "竹南鎮": (120.878, 24.692, 0.016),
     "頭份市": (120.909, 24.688, 0.016),
+    "苗栗市": (120.819, 24.560, 0.016),
+    "苑裡鎮": (120.654, 24.441, 0.016),
+    "通霄鎮": (120.678, 24.489, 0.016),
+    "後龍鎮": (120.786, 24.616, 0.016),
+    "公館鄉": (120.828, 24.501, 0.015),
+    "銅鑼鄉": (120.793, 24.482, 0.015),
+    "三義鄉": (120.768, 24.398, 0.015),
+    "造橋鄉": (120.864, 24.641, 0.014),
+    "頭屋鄉": (120.847, 24.582, 0.014),
     "西屯區": (120.635, 24.178, 0.018),
     "南屯區": (120.625, 24.142, 0.016),
     "北屯區": (120.698, 24.182, 0.018),
     "大雅區": (120.646, 24.229, 0.016),
-    "大里區": (120.678, 24.099, 0.015),
-    "太平區": (120.718, 24.126, 0.016),
+    "大里區": (120.678, 24.099, 0.016),
+    "太平區": (120.718, 24.126, 0.018),
     "豐原區": (120.718, 24.252, 0.016),
-    "潭子區": (120.705, 24.209, 0.014),
-    "神岡區": (120.661, 24.257, 0.015),
+    "潭子區": (120.705, 24.209, 0.015),
+    "神岡區": (120.661, 24.257, 0.016),
+    "烏日區": (120.624, 24.107, 0.016),
+    "大甲區": (120.623, 24.348, 0.017),
+    "龍井區": (120.545, 24.194, 0.016),
+    "霧峰區": (120.700, 24.062, 0.017),
+    "大肚區": (120.545, 24.154, 0.015),
+    "梧棲區": (120.531, 24.254, 0.015),
+    "后里區": (120.712, 24.305, 0.016),
+    "清水區": (120.561, 24.268, 0.017),
+    "外埔區": (120.654, 24.331, 0.014),
+    "石岡區": (120.780, 24.275, 0.012),
+    "東勢區": (120.828, 24.258, 0.015),
+    "新社區": (120.809, 24.234, 0.015),
     "沙鹿區": (120.566, 24.234, 0.016),
     "彰化市": (120.542, 24.072, 0.018),
-    "員林市": (120.574, 23.959, 0.016),
+    "鹿港鎮": (120.435, 24.057, 0.018),
+    "和美鎮": (120.498, 24.111, 0.017),
+    "線西鄉": (120.464, 24.133, 0.014),
+    "伸港鄉": (120.487, 24.151, 0.014),
+    "秀水鄉": (120.503, 24.035, 0.015),
+    "福興鄉": (120.443, 24.045, 0.015),
+    "花壇鄉": (120.541, 24.025, 0.015),
+    "埔鹽鄉": (120.467, 23.999, 0.015),
+    "溪湖鎮": (120.479, 23.962, 0.016),
+    "員林市": (120.574, 23.959, 0.017),
+    "埔心鄉": (120.544, 23.953, 0.014),
+    "大村鄉": (120.560, 23.993, 0.014),
+    "社頭鄉": (120.583, 23.896, 0.015),
+    "永靖鄉": (120.547, 23.924, 0.014),
+    "田中鎮": (120.588, 23.861, 0.015),
+    "北斗鎮": (120.525, 23.873, 0.015),
+    "二林鎮": (120.371, 23.899, 0.018),
+    "芳苑鄉": (120.320, 23.924, 0.017),
+    "埤頭鄉": (120.461, 23.892, 0.015),
+    "芬園鄉": (120.629, 24.014, 0.014),
+    "田尾鄉": (120.525, 23.891, 0.013),
+    "溪州鄉": (120.499, 23.851, 0.015),
+    "南投市": (120.685, 23.915, 0.018),
+    "草屯鎮": (120.684, 23.980, 0.017),
+    "埔里鎮": (120.966, 23.966, 0.018),
+    "竹山鎮": (120.683, 23.758, 0.017),
+    "名間鄉": (120.703, 23.838, 0.015),
+    "集集鎮": (120.784, 23.828, 0.013),
+    "水里鄉": (120.855, 23.812, 0.014),
+    "斗六市": (120.544, 23.709, 0.018),
+    "斗南鎮": (120.479, 23.679, 0.016),
+    "虎尾鎮": (120.434, 23.708, 0.017),
+    "西螺鎮": (120.460, 23.799, 0.016),
+    "麥寮鄉": (120.252, 23.752, 0.018),
+    "北港鎮": (120.303, 23.575, 0.016),
+    "土庫鎮": (120.391, 23.677, 0.015),
+    "莿桐鄉": (120.498, 23.758, 0.014),
+    "古坑鄉": (120.562, 23.642, 0.016),
+    "大埤鄉": (120.431, 23.643, 0.014),
+    "元長鄉": (120.312, 23.649, 0.014),
+    "崙背鄉": (120.354, 23.759, 0.014),
+    "二崙鄉": (120.413, 23.771, 0.014),
     "新市區": (120.285, 23.095, 0.015),
     "善化區": (120.292, 23.128, 0.016),
     "永康區": (120.256, 23.028, 0.015),
@@ -218,6 +295,11 @@ COUNTY_DISTRICT_ANCHORS: dict[tuple[str, str], tuple[float, float, float]] = {
     ("基隆市", "信義區"): (121.766, 25.131, 0.012),
     ("臺北市", "大安區"): (121.543, 25.026, 0.011),
     ("臺中市", "大安區"): (120.587, 24.366, 0.014),
+    ("臺中市", "中區"): (120.680, 24.144, 0.008),
+    ("臺中市", "東區"): (120.697, 24.139, 0.012),
+    ("臺中市", "西區"): (120.665, 24.142, 0.012),
+    ("臺中市", "南區"): (120.662, 24.119, 0.013),
+    ("臺中市", "北區"): (120.682, 24.161, 0.013),
 }
 
 DISTRICT_COUNTY_MAP: dict[str, tuple[str, ...]] = {
@@ -261,6 +343,15 @@ DISTRICT_COUNTY_MAP: dict[str, tuple[str, ...]] = {
     "新豐鄉": ("新竹縣",),
     "竹南鎮": ("苗栗縣",),
     "頭份市": ("苗栗縣",),
+    "苗栗市": ("苗栗縣",),
+    "苑裡鎮": ("苗栗縣",),
+    "通霄鎮": ("苗栗縣",),
+    "後龍鎮": ("苗栗縣",),
+    "公館鄉": ("苗栗縣",),
+    "銅鑼鄉": ("苗栗縣",),
+    "三義鄉": ("苗栗縣",),
+    "造橋鄉": ("苗栗縣",),
+    "頭屋鄉": ("苗栗縣",),
     "西屯區": ("臺中市",),
     "南屯區": ("臺中市",),
     "北屯區": ("臺中市",),
@@ -270,9 +361,67 @@ DISTRICT_COUNTY_MAP: dict[str, tuple[str, ...]] = {
     "豐原區": ("臺中市",),
     "潭子區": ("臺中市",),
     "神岡區": ("臺中市",),
+    "烏日區": ("臺中市",),
+    "大甲區": ("臺中市",),
+    "龍井區": ("臺中市",),
+    "霧峰區": ("臺中市",),
+    "大肚區": ("臺中市",),
+    "梧棲區": ("臺中市",),
+    "后里區": ("臺中市",),
+    "清水區": ("臺中市",),
+    "外埔區": ("臺中市",),
+    "石岡區": ("臺中市",),
+    "東勢區": ("臺中市",),
+    "新社區": ("臺中市",),
     "沙鹿區": ("臺中市",),
+    "中區": ("臺中市",),
+    "東區": ("臺中市", "新竹市", "嘉義市", "臺南市"),
+    "西區": ("臺中市", "嘉義市"),
+    "南區": ("臺中市", "臺南市"),
+    "北區": ("臺中市", "新竹市", "臺南市"),
     "彰化市": ("彰化縣",),
+    "鹿港鎮": ("彰化縣",),
+    "和美鎮": ("彰化縣",),
+    "線西鄉": ("彰化縣",),
+    "伸港鄉": ("彰化縣",),
+    "秀水鄉": ("彰化縣",),
+    "福興鄉": ("彰化縣",),
+    "花壇鄉": ("彰化縣",),
+    "埔鹽鄉": ("彰化縣",),
+    "溪湖鎮": ("彰化縣",),
     "員林市": ("彰化縣",),
+    "埔心鄉": ("彰化縣",),
+    "大村鄉": ("彰化縣",),
+    "社頭鄉": ("彰化縣",),
+    "永靖鄉": ("彰化縣",),
+    "田中鎮": ("彰化縣",),
+    "北斗鎮": ("彰化縣",),
+    "二林鎮": ("彰化縣",),
+    "芳苑鄉": ("彰化縣",),
+    "埤頭鄉": ("彰化縣",),
+    "芬園鄉": ("彰化縣",),
+    "田尾鄉": ("彰化縣",),
+    "溪州鄉": ("彰化縣",),
+    "南投市": ("南投縣",),
+    "草屯鎮": ("南投縣",),
+    "埔里鎮": ("南投縣",),
+    "竹山鎮": ("南投縣",),
+    "名間鄉": ("南投縣",),
+    "集集鎮": ("南投縣",),
+    "水里鄉": ("南投縣",),
+    "斗六市": ("雲林縣",),
+    "斗南鎮": ("雲林縣",),
+    "虎尾鎮": ("雲林縣",),
+    "西螺鎮": ("雲林縣",),
+    "麥寮鄉": ("雲林縣",),
+    "北港鎮": ("雲林縣",),
+    "土庫鎮": ("雲林縣",),
+    "莿桐鄉": ("雲林縣",),
+    "古坑鄉": ("雲林縣",),
+    "大埤鄉": ("雲林縣",),
+    "元長鄉": ("雲林縣",),
+    "崙背鄉": ("雲林縣",),
+    "二崙鄉": ("雲林縣",),
     "新市區": ("臺南市",),
     "善化區": ("臺南市",),
     "永康區": ("臺南市",),
@@ -443,7 +592,7 @@ ENG_DISTRICT_PATTERNS: list[tuple[str, str, tuple[str, ...] | None]] = [
     (rf"\b(?:SU\s*-?\s*AO)\b{_ROAD_FOLLOW_GUARD}", "蘇澳鎮", ("宜蘭縣",)),
 ]
 
-# Official TWSE/TPEx industry code mapping into 8 PoC sectors
+# Official TWSE/TPEx industry code mapping into 9 PoC sectors
 TWSE_INDUSTRY_MAP = {
     "24": "半導體與電子製造",  # 半導體業
     "25": "半導體與電子製造",  # 電腦及週邊設備業
@@ -459,27 +608,27 @@ TWSE_INDUSTRY_MAP = {
     "17": "金融控股與投資",     # 金融保險業
     "14": "營造工程與不動產",    # 建材營造
     "16": "餐飲旅宿與生活文創",  # 觀光餐旅
-    "04": "精密機械與傳統製造",  # 紡織纖維
+    "04": "傳統製造工業",       # 紡織纖維
     "32": "餐飲旅宿與生活文創",  # 文化創意業
-    "37": "精密機械與傳統製造",  # 運動休閒（自行車、製鞋、運動器材製造為主；場館/健身另判）
-    "15": "批發零售與國際貿易",  # 航運業（航太/造船另判精密機械與傳統製造）
+    "37": "金屬電機與精密機械",  # 運動休閒（自行車、製鞋、運動器材製造為主；場館/健身另判）
+    "15": "批發零售與國際貿易",  # 航運業（航太/造船另判金屬電機與精密機械）
     "18": "批發零售與國際貿易",  # 貿易百貨
-    "38": "批發零售與國際貿易",  # 居家生活
-    "01": "精密機械與傳統製造",  # 水泥工業
-    "02": "餐飲旅宿與生活文創",  # 食品工業
-    "03": "精密機械與傳統製造",  # 塑膠工業
-    "05": "精密機械與傳統製造",  # 電機機械
-    "06": "精密機械與傳統製造",  # 電器電纜
-    "08": "精密機械與傳統製造",  # 玻璃陶瓷
-    "09": "精密機械與傳統製造",  # 造紙工業
-    "10": "精密機械與傳統製造",  # 鋼鐵工業
-    "11": "精密機械與傳統製造",  # 橡膠工業
-    "12": "精密機械與傳統製造",  # 汽車工業
-    "19": "精密機械與傳統製造",  # 綜合
-    "20": "精密機械與傳統製造",  # 其他
-    "21": "精密機械與傳統製造",  # 化學工業
-    "23": "精密機械與傳統製造",  # 油電燃氣業
-    "33": "精密機械與傳統製造",  # 農林漁牧
+    "38": "傳統製造工業",       # 居家生活
+    "01": "傳統製造工業",       # 水泥工業
+    "02": "傳統製造工業",       # 食品工業
+    "03": "傳統製造工業",       # 塑膠工業
+    "05": "金屬電機與精密機械",  # 電機機械
+    "06": "金屬電機與精密機械",  # 電器電纜
+    "08": "傳統製造工業",       # 玻璃陶瓷
+    "09": "傳統製造工業",       # 造紙工業
+    "10": "金屬電機與精密機械",  # 鋼鐵工業
+    "11": "傳統製造工業",       # 橡膠工業
+    "12": "金屬電機與精密機械",  # 汽車工業
+    "19": "傳統製造工業",       # 綜合
+    "20": "傳統製造工業",       # 其他
+    "21": "傳統製造工業",       # 化學工業
+    "23": "傳統製造工業",       # 油電燃氣業
+    "33": "餐飲旅宿與生活文創",  # 農林漁牧
     "34": "生技醫療與綠能永續",  # 環保綠能
 }
 
@@ -491,9 +640,9 @@ CLUSTERS: list[dict[str, Any]] = [
         "en": "ALL TAIWAN",
         "center": [120.92, 23.75],
         "cam": {"yaw": -0.35, "pitch": 0.62, "zoom": 1.0},
-        "tagline": "經濟部 GCIS 商工登記 × 證交所 TWSE & 櫃買中心 TPEx 台股即時行情",
-        "narrative": "串聯經濟部實測商工登記與全臺上市櫃即時交易行情，呈現北部「金融與IC設計研發」、竹苗「半導體護國神山群」、中部「精密機械與光學」、南科「先進製程與綠能」至高雄「亞灣智慧港灣與封測S廊帶」的立體產業資本地圖。",
-        "highlights": ["GCIS×TWSE雙引擎", "上市櫃即時股價", "竹科半導體心臟", "AI 3D對話導覽", "8大聚落座標"],
+        "tagline": "經濟部 GCIS × 登記工廠名錄 × TWSE & TPEx 台股即時行情",
+        "narrative": "串聯經濟部實測商工登記、全台中部生產中製造業工廠與全臺上市櫃即時交易行情，呈現北部「金融與IC設計研發」、竹苗「半導體護國神山群」、中部「中彰投金屬電機、精密機械與傳統製造聚落」、南科「先進製程與綠能」至高雄「亞灣智慧港灣與封測S廊帶」的立體產業地圖。",
+        "highlights": ["GCIS×工廠名錄×TWSE", "中部金屬電機大聚落", "竹科半導體心臟", "AI 3D對話導覽", "8大聚落座標"],
     },
     {
         "id": "taipei_tech",
@@ -541,14 +690,14 @@ CLUSTERS: list[dict[str, Any]] = [
     },
     {
         "id": "taichung_precision",
-        "name": "臺中中科・西屯精密機械走廊",
-        "short": "臺中・中科精密",
-        "en": "TAICHUNG PRECISION CORRIDOR",
-        "center": [120.645, 24.165],
-        "cam": {"yaw": -0.42, "pitch": 0.72, "zoom": 3.5},
-        "tagline": "精密機械、光學鏡頭、航太與中臺灣製造冠軍",
-        "narrative": "結合西屯七期商辦、大肚山精密機械黃金縱谷與中部科學園區，孕育大立光、上銀、漢翔與龐大的工具機、自行車與車用零組件上市櫃隱形冠軍。",
-        "highlights": ["大肚山黃金縱谷", "精密工具機與光學", "中台灣企業總部群", "老牌隱形冠軍密集"],
+        "name": "中彰投・精密機械・金屬電機與傳產走廊",
+        "short": "中部・金屬機械傳產",
+        "en": "CENTRAL TAIWAN · METAL & MFG",
+        "center": [120.615, 24.115],
+        "cam": {"yaw": -0.42, "pitch": 0.70, "zoom": 3.0},
+        "tagline": "臺中神岡大里太平工具機 × 彰化水五金傳產 × 中部金屬電機大聚落",
+        "narrative": "橫跨臺中大里、神岡、太平、豐原、烏日、西屯中科至彰化鹿港、和美、員林及南投南崗工業區，完整收錄金屬製品、手工具、螺絲、電力電機、工具機及傳統製造萬家生產中工廠與大立光、上銀、漢翔等隱形冠軍。",
+        "highlights": ["萬家金屬電機工廠", "神岡大里太平工具機", "彰化水五金與傳產", "老牌製造隱形冠軍"],
     },
     {
         "id": "tainan_stsp",
@@ -588,12 +737,13 @@ CLUSTERS: list[dict[str, Any]] = [
 INDUSTRIES = [
     "半導體與電子製造",
     "AI與軟體資訊服務",
-    "精密機械與傳統製造",
+    "金屬電機與精密機械",
     "金融控股與投資",
     "批發零售與國際貿易",
     "生技醫療與綠能永續",
     "營造工程與不動產",
     "餐飲旅宿與生活文創",
+    "傳統製造工業",
 ]
 
 
@@ -661,7 +811,10 @@ def build_county_poly_index(geojson: dict[str, Any]) -> dict[str, dict[str, Any]
     return idx
 
 
-def fetch_json(url: str, retries: int = 2, timeout: int = 16) -> list[dict[str, Any]]:
+def fetch_url_bytes(
+    url: str, accept: str = "*/*", retries: int = 2, timeout: int = 20
+) -> bytes:
+    """Fetch URL bytes using strict TLS verification with logged SSLError fallback."""
     host = urllib.parse.urlsplit(url).netloc
     use_unverified = False
     for attempt in range(retries + 1):
@@ -670,16 +823,12 @@ def fetch_json(url: str, retries: int = 2, timeout: int = 16) -> list[dict[str, 
                 url,
                 headers={
                     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-                    "Accept": "application/json",
+                    "Accept": accept,
                 },
             )
             ctx = SSL_CTX_UNVERIFIED if use_unverified else SSL_CTX
             with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
-                raw = resp.read().decode("utf-8", errors="replace").strip()
-                if not raw:
-                    return []
-                data = json.loads(raw)
-                return data if isinstance(data, list) else []
+                return resp.read()
         except (ssl.SSLError, urllib.error.URLError) as exc:
             is_ssl = isinstance(exc, ssl.SSLError) or (
                 isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, ssl.SSLError)
@@ -696,7 +845,21 @@ def fetch_json(url: str, retries: int = 2, timeout: int = 16) -> list[dict[str, 
         except Exception:
             if attempt < retries:
                 time.sleep(0.4 * (attempt + 1))
-    return []
+    return b""
+
+
+def fetch_json(url: str, retries: int = 2, timeout: int = 16) -> list[dict[str, Any]]:
+    raw_bytes = fetch_url_bytes(url, accept="application/json", retries=retries, timeout=timeout)
+    if not raw_bytes:
+        return []
+    try:
+        raw = raw_bytes.decode("utf-8", errors="replace").strip()
+        if not raw:
+            return []
+        data = json.loads(raw)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
 
 
 def collect_live_gcis_records() -> tuple[dict[str, dict[str, Any]], set[str]]:
@@ -780,6 +943,9 @@ def load_or_collect_gcis_records(force_refresh: bool = False) -> tuple[dict[str,
                         "Company_Location": c.get("address", ""),
                         "Register_Organization_Desc": c.get("reg_org", ""),
                         "Company_Status": "01",
+                        "_fac_id": c.get("fac_id", ""),
+                        "_fac_prod": c.get("prod", ""),
+                        "_cap_est": bool(c.get("cap_est")),
                     }
                     if c.get("flagship"):
                         verified_flagships.add(ban)
@@ -787,6 +953,241 @@ def load_or_collect_gcis_records(force_refresh: bool = False) -> tuple[dict[str,
         except Exception as exc:
             print(f"[GCIS] Cache read failed ({exc}), fetching live GCIS...")
     return collect_live_gcis_records()
+
+
+def _parse_csv_bytes(raw_bytes: bytes) -> list[dict[str, str]]:
+    if not raw_bytes:
+        return []
+    txt = raw_bytes.decode("utf-8-sig", errors="replace")
+    return list(csv.DictReader(io.StringIO(txt)))
+
+
+def _resolve_ida_factory_zip_url() -> str:
+    raw = fetch_url_bytes(IDA_FACTORY_INDEX_CSV, retries=1, timeout=15)
+    for row in _parse_csv_bytes(raw):
+        link = (row.get("下載連結") or "").strip()
+        if link.startswith("http"):
+            return link
+    return IDA_FACTORY_ZIP_FALLBACK
+
+
+def _clean_fac_tags(ind_text: str, prod_text: str) -> str:
+    parts: list[str] = []
+    seen: set[str] = set()
+    for seg in re.split(r"[、,，]+", f"{ind_text}、{prod_text}"):
+        s = re.sub(r"^\d+\s*", "", seg.strip()).strip()
+        if s and s not in seen and s not in ("未分類其他製造業",):
+            seen.add(s)
+            parts.append(s)
+    return "・".join(parts)[:72]
+
+
+def enrich_central_mfg_and_factories(raw_records: dict[str, dict[str, Any]]) -> None:
+    """Download MOEA IDA active factories + GCIS Central Taiwan C-mfg CSVs and merge by BAN."""
+    zip_url = _resolve_ida_factory_zip_url()
+    urls = {
+        "fac_zip": zip_url,
+        "gcis_tc": f"https://data.gcis.nat.gov.tw/od/file?oid={OID_TAICHUNG_COMP_CMFG}",
+        "gcis_ct": f"https://data.gcis.nat.gov.tw/od/file?oid={OID_CENTRAL_COMP_CMFG}",
+        "biz_tc": f"https://data.gcis.nat.gov.tw/od/file?oid={OID_TAICHUNG_BIZ_CMFG}",
+    }
+    print("[CENTRAL] Fetching MOEA active factory registry + GCIS Central Taiwan C-mfg CSVs...")
+    blobs: dict[str, bytes] = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futs = {pool.submit(fetch_url_bytes, u, "*/*", 2, 45): k for k, u in urls.items()}
+        for fut in as_completed(futs):
+            k = futs[fut]
+            blobs[k] = fut.result()
+
+    # 1. Index GCIS Central Taiwan company & Taichung commercial registrations
+    gcis_central_map: dict[str, dict[str, str]] = {}
+    for key in ("gcis_tc", "gcis_ct"):
+        for r in _parse_csv_bytes(blobs.get(key, b"")):
+            if (r.get("登記狀態") or "").strip() != "核准設立":
+                continue
+            ban = (r.get("統一編號") or "").strip()
+            if re.fullmatch(r"\d{8}", ban):
+                gcis_central_map[ban] = r
+
+    biz_tc_map: dict[str, dict[str, str]] = {}
+    for r in _parse_csv_bytes(blobs.get("biz_tc", b"")):
+        ban = (r.get("統一編號") or "").strip()
+        if re.fullmatch(r"\d{8}", ban):
+            biz_tc_map[ban] = r
+
+    # 2. Parse MOEA active factory registry (生產中工廠清冊.zip)
+    fac_bytes = blobs.get("fac_zip", b"")
+    fac_rows: list[dict[str, str]] = []
+    if fac_bytes:
+        try:
+            with zipfile.ZipFile(io.BytesIO(fac_bytes)) as zf:
+                csv_name = next((n for n in zf.namelist() if n.lower().endswith(".csv")), zf.namelist()[0])
+                fac_rows = _parse_csv_bytes(zf.read(csv_name))
+        except Exception as exc:
+            print(f"[CENTRAL] Factory ZIP parse failed: {exc}")
+
+    # Aggregate Central Taiwan traditional & metal/electrical/machinery factories by BAN
+    central_fac_map: dict[str, dict[str, Any]] = {}
+    for row in fac_rows:
+        if (row.get("工廠登記狀態") or "").strip() != "生產中":
+            continue
+        addr = normalize_tw_text(row.get("工廠地址") or row.get("工廠市鎮鄉村里") or "")
+        county_guess, _ = parse_county_and_district(addr, "")
+        if county_guess not in CENTRAL_COUNTIES:
+            continue
+        ind_str = (row.get("產業類別") or "").strip()
+        codes = re.findall(r"(?<!\d)(\d{2})(?=[^\d])", ind_str)
+        if not any(cd in TARGET_CENTRAL_MFG_2D for cd in codes):
+            continue
+        ban = (row.get("統一編號") or "").strip()
+        if not re.fullmatch(r"\d{8}", ban):
+            continue
+
+        fac_id = (row.get("工廠登記編號") or "").strip()
+        fac_name = (row.get("工廠名稱") or "").strip()
+        prod_str = (row.get("主要產品") or "").strip()
+        resp = (row.get("工廠負責人姓名") or "").strip()
+        setup_d = (row.get("工廠設立核准日期") or row.get("工廠登記核准日期") or "").strip()
+
+        entry = central_fac_map.get(ban)
+        if entry is None:
+            central_fac_map[ban] = {
+                "fac_ids": [fac_id] if fac_id else [],
+                "fac_name": fac_name,
+                "addr": addr,
+                "resp": resp,
+                "setup_date": setup_d,
+                "ind_codes": list(codes),
+                "ind_str": ind_str,
+                "prod_str": prod_str,
+            }
+        else:
+            if fac_id and fac_id not in entry["fac_ids"]:
+                entry["fac_ids"].append(fac_id)
+            for cd in codes:
+                if cd not in entry["ind_codes"]:
+                    entry["ind_codes"].append(cd)
+            if prod_str and prod_str not in entry["prod_str"]:
+                entry["prod_str"] = f"{entry['prod_str']}、{prod_str}".strip("、")
+
+    def _dgbas_list(row: dict[str, str]) -> list[str]:
+        raw_c = row.get("行業代號（財政資訊中心匯入）") or ""
+        return [c.strip()[:2] for c in raw_c.split(",") if c.strip() and c.strip()[:2].isdigit()]
+
+    def _pick_cap(row: dict[str, str]) -> int:
+        for k in ("實收資本額", "資本總額"):
+            v = re.sub(r"\D", "", str(row.get(k) or ""))
+            if v and int(v) > 0:
+                return int(v)
+        return 0
+
+    added_fac = 0
+    enriched_existing = 0
+    for ban, fac in central_fac_map.items():
+        g_row = gcis_central_map.get(ban)
+        b_row = biz_tc_map.get(ban)
+        fac_tag = _clean_fac_tags(fac["ind_str"], fac["prod_str"])
+        fac_id_joined = ",".join(fac["fac_ids"][:3])
+
+        if ban in raw_records:
+            rec = raw_records[ban]
+            rec["_fac_id"] = fac_id_joined or rec.get("_fac_id", "")
+            rec["_fac_prod"] = fac_tag or rec.get("_fac_prod", "")
+            rec["_fac_codes"] = fac["ind_codes"]
+            if g_row:
+                rec["_dgbas_codes"] = _dgbas_list(g_row)
+                cap = _pick_cap(g_row)
+                if cap > 0 and int(rec.get("Paid_In_Capital_Amount") or 0) <= 0:
+                    rec["Paid_In_Capital_Amount"] = cap
+                    rec["Capital_Stock_Amount"] = cap
+                    rec["_cap_est"] = False
+            elif b_row:
+                rec["_dgbas_codes"] = _dgbas_list(b_row)
+            enriched_existing += 1
+            continue
+
+        if g_row:
+            cap = _pick_cap(g_row)
+            g_addr = normalize_tw_text(g_row.get("公司地址") or "")
+            g_county, _ = parse_county_and_district(g_addr, "")
+            loc = g_addr if g_county in CENTRAL_COUNTIES else fac["addr"]
+            name = (g_row.get("公司名稱") or fac["fac_name"]).strip()
+            setup_date = (g_row.get("核准設立日期") or fac["setup_date"]).strip()
+            dgbas = _dgbas_list(g_row)
+            reg_org = "經濟部商工×工廠登記"
+            cap_est = cap <= 0
+        elif b_row:
+            cap = _pick_cap(b_row)
+            b_addr = normalize_tw_text(b_row.get("商業地址") or "")
+            b_county, _ = parse_county_and_district(b_addr, "")
+            loc = b_addr if b_county in CENTRAL_COUNTIES else fac["addr"]
+            name = (b_row.get("商業名稱") or fac["fac_name"]).strip()
+            setup_date = (b_row.get("核准設立日期") or fac["setup_date"]).strip()
+            dgbas = _dgbas_list(b_row)
+            reg_org = "臺中市政府(商業×工廠)"
+            cap_est = cap <= 0
+        else:
+            name = re.sub(r"(公司)工廠$", r"\1", fac["fac_name"]).strip()
+            loc = fac["addr"]
+            cap = 0
+            setup_date = fac["setup_date"]
+            dgbas = []
+            reg_org = "經濟部產業發展署(工廠登記)"
+            cap_est = True
+
+        raw_records[ban] = {
+            "Business_Accounting_NO": ban,
+            "Company_Name": name,
+            "Responsible_Name": fac["resp"] or "—",
+            "Paid_In_Capital_Amount": cap,
+            "Capital_Stock_Amount": cap,
+            "Company_Setup_Date": setup_date,
+            "Company_Location": loc,
+            "Register_Organization_Desc": reg_org,
+            "Company_Status": "01",
+            "_fac_id": fac_id_joined,
+            "_fac_prod": fac_tag,
+            "_fac_codes": fac["ind_codes"],
+            "_dgbas_codes": dgbas,
+            "_cap_est": cap_est,
+        }
+        added_fac += 1
+
+    # 3. Also add extra Central Taiwan active GCIS C-mfg companies whose primary tax SIC is TARGET_CENTRAL_MFG_2D
+    added_gcis_mfg = 0
+    for ban, g_row in gcis_central_map.items():
+        if ban in raw_records:
+            continue
+        dgbas = _dgbas_list(g_row)
+        if not dgbas or dgbas[0] not in TARGET_CENTRAL_MFG_2D:
+            continue
+        addr = normalize_tw_text(g_row.get("公司地址") or "")
+        county_g, _ = parse_county_and_district(addr, "")
+        if county_g not in CENTRAL_COUNTIES:
+            continue
+        cap = _pick_cap(g_row)
+        raw_records[ban] = {
+            "Business_Accounting_NO": ban,
+            "Company_Name": (g_row.get("公司名稱") or "").strip(),
+            "Responsible_Name": "—",
+            "Paid_In_Capital_Amount": cap,
+            "Capital_Stock_Amount": cap,
+            "Company_Setup_Date": (g_row.get("核准設立日期") or "").strip(),
+            "Company_Location": addr,
+            "Register_Organization_Desc": "經濟部 GCIS(中部製造業)",
+            "Company_Status": "01",
+            "_fac_id": "",
+            "_fac_prod": "",
+            "_fac_codes": [],
+            "_dgbas_codes": dgbas,
+            "_cap_est": cap <= 0,
+        }
+        added_gcis_mfg += 1
+
+    print(
+        f"[CENTRAL] Enriched {enriched_existing} existing + added {added_fac} Central active factories "
+        f"+ {added_gcis_mfg} GCIS Central DGBAS manufacturers (total pool: {len(raw_records)})"
+    )
 
 
 def safe_float(val: Any) -> float | None:
@@ -1086,15 +1487,22 @@ def assign_cluster(county: str, district: str, loc: str) -> str:
     return "east_offshore"
 
 
-def classify_industry(name: str, reg_org: str = "", twse_ind_code: str = "") -> str:
+def classify_industry(
+    name: str,
+    reg_org: str = "",
+    twse_ind_code: str = "",
+    dgbas_codes: list[str] | None = None,
+    fac_codes: list[str] | None = None,
+    prod_hint: str = "",
+) -> str:
     if twse_ind_code:
         if twse_ind_code == "37":
             if any(k in name for k in ("大魯閣", "柏文", "健身", "邁達康")):
                 return "餐飲旅宿與生活文創"
-            return "精密機械與傳統製造"
+            return "金屬電機與精密機械"
         if twse_ind_code == "15":
             if any(k in name for k in ("漢翔", "台船", "造船", "航太", "航空工業", "亞航")):
-                return "精密機械與傳統製造"
+                return "金屬電機與精密機械"
             return "批發零售與國際貿易"
         if twse_ind_code in TWSE_INDUSTRY_MAP:
             # Refine telecoms (中華電、台灣大、遠傳) & networking/cloud if needed
@@ -1105,7 +1513,22 @@ def classify_industry(name: str, reg_org: str = "", twse_ind_code: str = "") -> 
                 return "AI與軟體資訊服務"
             return TWSE_INDUSTRY_MAP[twse_ind_code]
 
-    # Unlisted classification: specific sectors BEFORE generic '科技' / '電子'
+    # Official MOEA Factory & Finance Tax SIC classification (highest reliability for unlisted mfg)
+    all_sic = list(fac_codes or []) + list(dgbas_codes or [])
+    if all_sic:
+        if any(cd in METAL_ELEC_MACH_2D for cd in all_sic):
+            return "金屬電機與精密機械"
+        if any(cd in ("26", "27") for cd in all_sic):
+            return "半導體與電子製造"
+        if any(cd in TRAD_MFG_2D for cd in all_sic):
+            return "傳統製造工業"
+    if prod_hint:
+        if any(k in prod_hint for k in ("基本金屬", "金屬製品", "電力設備", "機械設備", "汽車及其零件", "其他運輸工具", "螺絲", "手工具", "刀具", "模具", "工具機", "自行車", "齒輪", "電線", "配線")):
+            return "金屬電機與精密機械"
+        if any(k in prod_hint for k in ("塑膠", "紡織", "食品", "非金屬", "家具", "木竹", "造紙", "印刷", "橡膠", "化學", "成衣", "皮革")):
+            return "傳統製造工業"
+
+    # Unlisted name heuristics: specific sectors BEFORE generic '科技' / '電子'
     if any(k in name for k in ("半導體", "積體電路", "晶圓", "封測", "電路板", "被動元件", "聯電", "聯發", "和碩", "緯創", "緯穎", "台虹", "宏捷", "大立光", "晶相", "記憶體")):
         return "半導體與電子製造"
     if any(k in name for k in ("生技", "生物科技", "生醫", "醫藥", "醫療", "藥業", "製藥", "健康", "疫苗", "基因", "綠能", "太陽能", "能源", "風電", "環保", "儲能", "潔淨", "永續", "水資源", "碳權")):
@@ -1119,8 +1542,10 @@ def classify_industry(name: str, reg_org: str = "", twse_ind_code: str = "") -> 
         return "半導體與電子製造"
     if any(k in name for k in ("金融", "金控", "銀行", "證券", "保險", "投資", "控股", "創投", "資產管理", "租賃", "票券", "期貨", "保經")):
         return "金融控股與投資"
-    if any(k in name for k in ("機械", "精密", "工具機", "自動化", "五金", "鋼鐵", "金屬", "工業", "模具", "塑膠", "化學", "化工", "材料", "紡織", "纖維", "染整", "成衣", "製鞋", "自行車", "電機", "航太", "造船", "漢翔", "台船", "奇美", "巨大", "美利達", "寶成", "造紙", "用紙", "水泥")):
-        return "精密機械與傳統製造"
+    if any(k in name for k in ("機械", "精密", "工具機", "自動化", "五金", "鋼鐵", "金屬", "模具", "螺絲", "齒輪", "泵", "閥", "軸承", "電機", "鍛造", "鑄造", "沖壓", "自行車", "車床", "航太", "造船", "漢翔", "台船", "巨大", "美利達")):
+        return "金屬電機與精密機械"
+    if any(k in name for k in ("工業", "塑膠", "化學", "化工", "材料", "紡織", "纖維", "染整", "成衣", "製鞋", "寶成", "奇美", "造紙", "用紙", "水泥", "陶瓷", "玻璃", "木業", "家具", "橡膠", "壓克力")):
+        return "傳統製造工業"
     if any(k in name for k in ("營造", "建設", "建築", "不動產", "地產", "工程顧問", "顧問", "開發", "機電")):
         return "營造工程與不動產"
     if any(k in name for k in ("餐飲", "食品", "咖啡", "烘焙", "觀光", "飯店", "旅宿", "旅館", "民宿", "文創", "娛樂", "休閒", "農", "茶", "統一企業")):
@@ -1181,9 +1606,66 @@ def deterministic_coord(
     return round(clon, 5), round(clat, 5)
 
 
-def sync_payload_to_html(compact_json: str) -> None:
+def _default_short_name(name: str) -> str:
+    clean_short = re.sub(
+        r"(股份有限公司|有限公司|商業銀行|金融控股|企業團)$", "", name
+    ).strip()
+    return clean_short[:11] if clean_short else name[:11]
+
+
+def pack_payload_for_html(payload: dict[str, Any]) -> str:
+    """Strip derived/default fields for compact HTML embedding; JS hydrateGcisData restores them."""
+    packed_comps: list[dict[str, Any]] = []
+    for x in payload["companies"]:
+        row: dict[str, Any] = {
+            "ban": x["ban"],
+            "name": x["name"],
+            "capital": x["capital"],
+            "cap_tier_i": x["cap_tier_i"],
+            "age_tier_i": x["age_tier_i"],
+            "county": x["county"],
+            "address": x["address"],
+            "reg_org": x["reg_org"],
+            "cluster": x["cluster"],
+            "ind_i": x["ind_i"],
+            "lon": x["lon"],
+            "lat": x["lat"],
+            "pr": x["pr"],
+        }
+        if x.get("short") and x["short"] != _default_short_name(x["name"]):
+            row["short"] = x["short"]
+        if x.get("responsible") and x["responsible"] != "—":
+            row["responsible"] = x["responsible"]
+        if x.get("setup_date"):
+            row["setup_date"] = x["setup_date"]
+        if x.get("setup_year") is not None:
+            row["setup_year"] = x["setup_year"]
+        if x.get("district") and x["district"] != x["county"]:
+            row["district"] = x["district"]
+        if x.get("flagship"):
+            row["flagship"] = True
+        if x.get("stock") is not None:
+            row["stock"] = x["stock"]
+        if x.get("prod"):
+            row["prod"] = x["prod"]
+        if x.get("fac_id"):
+            row["fac_id"] = x["fac_id"]
+        if x.get("cap_est"):
+            row["cap_est"] = True
+        packed_comps.append(row)
+    packed_payload = {
+        "meta": payload["meta"],
+        "industries": payload["industries"],
+        "clusters": payload["clusters"],
+        "companies": packed_comps,
+    }
+    return json.dumps(packed_payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def sync_payload_to_html(payload: dict[str, Any]) -> None:
+    packed_json = pack_payload_for_html(payload)
     pattern = re.compile(r"^window\.__GCIS_DATA__\s*=\s*\{.*?\};[ \t]*$", re.MULTILINE)
-    replacement = f"window.__GCIS_DATA__ = {compact_json};"
+    replacement = f"window.__GCIS_DATA__ = {packed_json};"
     for html_path in (POC_HTML, INDEX_HTML):
         if not html_path.exists():
             continue
@@ -1193,15 +1675,19 @@ def sync_payload_to_html(compact_json: str) -> None:
         new_text, count = pattern.subn(lambda _: replacement, text, count=1)
         if count:
             html_path.write_text(new_text, encoding="utf-8")
-            print(f"[SYNC] Updated window.__GCIS_DATA__ in {html_path}")
+            print(f"[SYNC] Updated window.__GCIS_DATA__ in {html_path} ({len(packed_json)/1e6:.2f} MB payload)")
 
 
 def main() -> None:
     force_refresh = "--refresh-gcis" in sys.argv
+    refresh_central = "--refresh-central" in sys.argv
+    skip_central = "--skip-central" in sys.argv
     sync_html = "--sync-html" in sys.argv
     geojson = load_taiwan_geojson()
     county_polys = build_county_poly_index(geojson)
     raw_records, verified_flagships = load_or_collect_gcis_records(force_refresh=force_refresh)
+    if not skip_central and (refresh_central or force_refresh or not any(r.get("_fac_prod") for r in raw_records.values())):
+        enrich_central_mfg_and_factories(raw_records)
     stocks_by_ban, twse_date = fetch_twse_tpex_stocks()
 
     # Merge TWSE/TPEx domestic companies that are not yet in GCIS sample
@@ -1238,6 +1724,7 @@ def main() -> None:
             added_from_twse += 1
         elif st["capital"] > 0 and int(raw_records[ban].get("Paid_In_Capital_Amount") or 0) <= 0:
             raw_records[ban]["Paid_In_Capital_Amount"] = st["capital"]
+            raw_records[ban]["_cap_est"] = False
         # Prefer richer Chinese address if raw_records has empty/English address
         if ban in raw_records and (not raw_records[ban].get("Company_Location")) and st["address"]:
             raw_records[ban]["Company_Location"] = st["address"]
@@ -1267,8 +1754,9 @@ def main() -> None:
         capital = cap_paid if cap_paid > 0 else cap_stock
         if st and st.get("capital", 0) > capital:
             capital = st["capital"]
+        cap_est = bool(r.get("_cap_est")) and capital <= 0
         if capital <= 0:
-            capital = 100000
+            capital = 0 if cap_est else 100000
 
         setup_year = parse_setup_year(r.get("Company_Setup_Date"), current_year=current_year)
         age = max(0, current_year - setup_year) if setup_year is not None else None
@@ -1306,7 +1794,14 @@ def main() -> None:
             age_tier_idx = 0
 
         twse_ind_code = st["ind_code"] if st else ""
-        industry = classify_industry(name, reg_org, twse_ind_code)
+        industry = classify_industry(
+            name,
+            reg_org,
+            twse_ind_code,
+            dgbas_codes=r.get("_dgbas_codes"),
+            fac_codes=r.get("_fac_codes"),
+            prod_hint=str(r.get("_fac_prod") or ""),
+        )
         ind_idx = INDUSTRIES.index(industry)
         cluster = assign_cluster(county, district, loc)
         lon, lat = deterministic_coord(ban, county, district, county_polys)
@@ -1321,10 +1816,7 @@ def main() -> None:
         if st and st.get("abbr"):
             short_name = st["abbr"]
         else:
-            clean_short = re.sub(
-                r"(股份有限公司|有限公司|商業銀行|金融控股|企業團)$", "", name
-            ).strip()
-            short_name = clean_short[:11] if clean_short else name[:11]
+            short_name = _default_short_name(name)
 
         compact_stock = None
         if st:
@@ -1345,41 +1837,48 @@ def main() -> None:
                 "date": st["date"],
             }
 
-        items.append(
-            {
-                "ban": ban,
-                "name": name,
-                "short": short_name,
-                "responsible": str(r.get("Responsible_Name") or "—").strip(),
-                "capital": capital,
-                "cap_tier": cap_tier,
-                "cap_tier_i": cap_tier_idx,
-                "setup_date": str(r.get("Company_Setup_Date") or "").strip(),
-                "setup_year": setup_year,
-                "age": age,
-                "age_tier": age_tier,
-                "age_tier_i": age_tier_idx,
-                "county": county,
-                "district": district or county,
-                "address": loc,
-                "reg_org": reg_org,
-                "cluster": cluster,
-                "industry": industry,
-                "ind_i": ind_idx,
-                "lon": lon,
-                "lat": lat,
-                "flagship": is_flagship,
-                "stock": compact_stock,
-            }
-        )
+        item: dict[str, Any] = {
+            "ban": ban,
+            "name": name,
+            "short": short_name,
+            "responsible": str(r.get("Responsible_Name") or "—").strip(),
+            "capital": capital,
+            "cap_tier": cap_tier,
+            "cap_tier_i": cap_tier_idx,
+            "setup_date": str(r.get("Company_Setup_Date") or "").strip(),
+            "setup_year": setup_year,
+            "age": age,
+            "age_tier": age_tier,
+            "age_tier_i": age_tier_idx,
+            "county": county,
+            "district": district or county,
+            "address": loc,
+            "reg_org": reg_org,
+            "cluster": cluster,
+            "industry": industry,
+            "ind_i": ind_idx,
+            "lon": lon,
+            "lat": lat,
+            "flagship": is_flagship,
+            "stock": compact_stock,
+        }
+        if r.get("_fac_prod"):
+            item["prod"] = str(r["_fac_prod"])
+        if r.get("_fac_id"):
+            item["fac_id"] = str(r["_fac_id"])
+        if cap_est:
+            item["cap_est"] = True
+        items.append(item)
 
-    # Compute exact capital percentile PR (1..99)
-    sorted_caps = sorted(x["capital"] for x in items)
-    total_n = len(sorted_caps)
+    # Compute capital percentile PR (1..99) strictly over companies with known corporate capital > 0
+    sorted_caps = sorted(x["capital"] for x in items if x["capital"] > 0)
+    total_known_cap = len(sorted_caps)
     for x in items:
-        rank = bisect.bisect_right(sorted_caps, x["capital"])
-        pr = min(99, max(1, int(round((rank / max(1, total_n)) * 99))))
-        x["pr"] = pr
+        if x["capital"] <= 0 or total_known_cap == 0:
+            x["pr"] = 1
+        else:
+            rank = bisect.bisect_right(sorted_caps, x["capital"])
+            x["pr"] = min(99, max(1, int(round((rank / total_known_cap) * 99))))
 
     # Sort flagships & listed giants first
     items.sort(
@@ -1428,8 +1927,9 @@ def main() -> None:
 
     payload = {
         "meta": {
-            "source": "經濟部 GCIS 商工開放平臺 × 證交所 TWSE & 櫃買中心 TPEx OpenAPI",
+            "source": "經濟部 GCIS × 登記工廠名錄 × TWSE & TPEx OpenAPI",
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "data_year": current_year,
             "twse_trade_date": twse_date,
             "total_records": len(items),
             "listed_count": listed_total,
@@ -1448,10 +1948,10 @@ def main() -> None:
     compact_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     OUTPUT_JSON.write_text(compact_json, encoding="utf-8")
     if sync_html:
-        sync_payload_to_html(compact_json)
+        sync_payload_to_html(payload)
     print(
         f"[DONE] Saved {len(items)} companies ({listed_twse} 上市 + {listed_tpex} 上櫃 = {listed_total} 上市櫃) "
-        f"across {payload['meta']['counties_covered']} counties -> {OUTPUT_JSON}"
+        f"across {payload['meta']['counties_covered']} counties -> {OUTPUT_JSON} ({len(compact_json)/1e6:.2f} MB)"
     )
     for cid, st in cluster_stats.items():
         top_name = st["top_industries"][0]["name"] if st["top_industries"] else "-"
