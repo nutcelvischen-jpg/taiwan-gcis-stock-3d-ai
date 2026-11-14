@@ -48,6 +48,29 @@ CENTRAL_COUNTIES = {"臺中市", "彰化縣", "南投縣", "苗栗縣", "雲林�
 METAL_ELEC_MACH_2D = {"24", "25", "28", "29", "30", "31"}
 TRAD_MFG_2D = {"08", "09", "10", "11", "12", "13", "14", "15", "16", "18", "19", "21", "22", "23", "32", "33"}
 TARGET_CENTRAL_MFG_2D = METAL_ELEC_MACH_2D | TRAD_MFG_2D
+ALL_MFG_SIC_2D = TARGET_CENTRAL_MFG_2D | {"17", "20", "26", "27"}
+TWSE_TO_MFG_SIC = {
+    "01": "23",  # 水泥
+    "02": "08",  # 食品
+    "03": "22",  # 塑膠
+    "04": "11",  # 紡織纖維
+    "05": "29",  # 電機機械
+    "06": "28",  # 電器電纜
+    "08": "23",  # 玻璃陶瓷
+    "09": "15",  # 造紙
+    "10": "24",  # 鋼鐵
+    "11": "21",  # 橡膠
+    "12": "30",  # 汽車
+    "21": "18",  # 化學
+    "22": "20",  # 生技醫療
+    "23": "17",  # 油電燃氣/石油煤
+    "24": "26",  # 半導體
+    "25": "27",  # 電腦及週邊設備
+    "26": "27",  # 光電
+    "27": "27",  # 通信網路
+    "28": "26",  # 電子零組件
+    "31": "26",  # 其他電子
+}
 
 # Live TWSE & TPEx OpenAPI endpoints
 TWSE_INFO_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
@@ -945,6 +968,7 @@ def load_or_collect_gcis_records(force_refresh: bool = False) -> tuple[dict[str,
                         "Company_Status": "01",
                         "_fac_id": c.get("fac_id", ""),
                         "_fac_prod": c.get("prod", ""),
+                        "_sic_codes": [s for s in str(c.get("sic") or "").split(",") if s],
                         "_cap_est": bool(c.get("cap_est")),
                     }
                     if c.get("flagship"):
@@ -1027,25 +1051,38 @@ def enrich_central_mfg_and_factories(raw_records: dict[str, dict[str, Any]]) -> 
             print(f"[CENTRAL] Factory ZIP parse failed: {exc}")
 
     # Aggregate Central Taiwan traditional & metal/electrical/machinery factories by BAN
+    # Plus collect nationwide factory SIC codes for companies already present in raw_records
     central_fac_map: dict[str, dict[str, Any]] = {}
+    nation_fac_by_ban: dict[str, dict[str, Any]] = {}
     for row in fac_rows:
         if (row.get("工廠登記狀態") or "").strip() != "生產中":
-            continue
-        addr = normalize_tw_text(row.get("工廠地址") or row.get("工廠市鎮鄉村里") or "")
-        county_guess, _ = parse_county_and_district(addr, "")
-        if county_guess not in CENTRAL_COUNTIES:
-            continue
-        ind_str = (row.get("產業類別") or "").strip()
-        codes = re.findall(r"(?<!\d)(\d{2})(?=[^\d])", ind_str)
-        if not any(cd in TARGET_CENTRAL_MFG_2D for cd in codes):
             continue
         ban = (row.get("統一編號") or "").strip()
         if not re.fullmatch(r"\d{8}", ban):
             continue
-
+        ind_str = (row.get("產業類別") or "").strip()
+        codes = re.findall(r"(?<!\d)(\d{2})(?=[^\d])", ind_str)
         fac_id = (row.get("工廠登記編號") or "").strip()
-        fac_name = (row.get("工廠名稱") or "").strip()
         prod_str = (row.get("主要產品") or "").strip()
+
+        if ban in raw_records:
+            nf = nation_fac_by_ban.setdefault(ban, {"codes": [], "fac_ids": [], "tag": ""})
+            for cd in codes:
+                if cd in ALL_MFG_SIC_2D and cd not in nf["codes"]:
+                    nf["codes"].append(cd)
+            if fac_id and fac_id not in nf["fac_ids"]:
+                nf["fac_ids"].append(fac_id)
+            if not nf["tag"]:
+                nf["tag"] = _clean_fac_tags(ind_str, prod_str)
+
+        addr = normalize_tw_text(row.get("工廠地址") or row.get("工廠市鎮鄉村里") or "")
+        county_guess, _ = parse_county_and_district(addr, "")
+        if county_guess not in CENTRAL_COUNTIES:
+            continue
+        if not any(cd in TARGET_CENTRAL_MFG_2D for cd in codes):
+            continue
+
+        fac_name = (row.get("工廠名稱") or "").strip()
         resp = (row.get("工廠負責人姓名") or "").strip()
         setup_d = (row.get("工廠設立核准日期") or row.get("工廠登記核准日期") or "").strip()
 
@@ -1156,9 +1193,11 @@ def enrich_central_mfg_and_factories(raw_records: dict[str, dict[str, Any]]) -> 
     # 3. Also add extra Central Taiwan active GCIS C-mfg companies whose primary tax SIC is TARGET_CENTRAL_MFG_2D
     added_gcis_mfg = 0
     for ban, g_row in gcis_central_map.items():
-        if ban in raw_records:
-            continue
         dgbas = _dgbas_list(g_row)
+        if ban in raw_records:
+            if dgbas and not raw_records[ban].get("_dgbas_codes"):
+                raw_records[ban]["_dgbas_codes"] = dgbas
+            continue
         if not dgbas or dgbas[0] not in TARGET_CENTRAL_MFG_2D:
             continue
         addr = normalize_tw_text(g_row.get("公司地址") or "")
@@ -1183,6 +1222,24 @@ def enrich_central_mfg_and_factories(raw_records: dict[str, dict[str, Any]]) -> 
             "_cap_est": cap <= 0,
         }
         added_gcis_mfg += 1
+
+    # 3b. Attach nationwide factory SIC codes & Taichung commercial DGBAS codes to existing companies
+    for ban, nf in nation_fac_by_ban.items():
+        rec = raw_records.get(ban)
+        if not rec:
+            continue
+        if nf["codes"] and not rec.get("_fac_codes"):
+            rec["_fac_codes"] = nf["codes"]
+        if nf["fac_ids"] and not rec.get("_fac_id"):
+            rec["_fac_id"] = ",".join(nf["fac_ids"][:3])
+        if nf["tag"] and not rec.get("_fac_prod"):
+            rec["_fac_prod"] = nf["tag"]
+    for ban, b_row in biz_tc_map.items():
+        rec = raw_records.get(ban)
+        if rec and not rec.get("_dgbas_codes"):
+            dgbas_b = _dgbas_list(b_row)
+            if dgbas_b:
+                rec["_dgbas_codes"] = dgbas_b
 
     print(
         f"[CENTRAL] Enriched {enriched_existing} existing + added {added_fac} Central active factories "
@@ -1648,6 +1705,8 @@ def pack_payload_for_html(payload: dict[str, Any]) -> str:
             row["stock"] = x["stock"]
         if x.get("prod"):
             row["prod"] = x["prod"]
+        if x.get("sic"):
+            row["sic"] = x["sic"]
         if x.get("fac_id"):
             row["fac_id"] = x["fac_id"]
         if x.get("cap_est"):
@@ -1866,6 +1925,15 @@ def main() -> None:
             item["prod"] = str(r["_fac_prod"])
         if r.get("_fac_id"):
             item["fac_id"] = str(r["_fac_id"])
+        sic_list: list[str] = []
+        for cd in list(r.get("_fac_codes") or []) + list(r.get("_dgbas_codes") or []) + list(r.get("_sic_codes") or []):
+            s2 = str(cd).strip()[:2]
+            if s2 in ALL_MFG_SIC_2D and s2 not in sic_list:
+                sic_list.append(s2)
+        if not sic_list and twse_ind_code in TWSE_TO_MFG_SIC:
+            sic_list.append(TWSE_TO_MFG_SIC[twse_ind_code])
+        if sic_list:
+            item["sic"] = ",".join(sic_list)
         if cap_est:
             item["cap_est"] = True
         items.append(item)
