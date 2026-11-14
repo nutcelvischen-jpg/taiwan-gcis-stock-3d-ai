@@ -14,6 +14,7 @@ import random
 import re
 import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -22,9 +23,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-WORKSPACE = Path("/Users/chenchunchih/Desktop/數據視覺化")
+WORKSPACE = Path(__file__).resolve().parent.parent
 GEO_MAPS_JS = WORKSPACE / "js" / "universal_geo_maps.js"
 OUTPUT_JSON = WORKSPACE / "sample_data" / "gcis_industry_poc_data.json"
+POC_HTML = WORKSPACE / "gcis_industry_3d_poc.html"
+INDEX_HTML = WORKSPACE / "index.html"
 
 # Verified GCIS Open Data API endpoints
 OID_CAPITAL = "F0E8FB8D-E2FD-472E-886C-91C673641F31"
@@ -40,7 +43,10 @@ TPEX_INFO_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"
 TPEX_DAY_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
 TPEX_VAL_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis"
 
-SSL_CTX = ssl._create_unverified_context()
+SSL_CTX = ssl.create_default_context()
+SSL_CTX_UNVERIFIED = ssl._create_unverified_context()
+_TLS_WARN_LOCK = threading.Lock()
+_TLS_WARNED_HOSTS: set[str] = set()
 
 # Representative Taiwan enterprises to include as curated anchor queries
 ANCHOR_BANS = [
@@ -98,6 +104,28 @@ COUNTY_CENTROIDS: dict[str, tuple[float, float]] = {
     "澎湖縣": (119.579, 23.568),
     "金門縣": (118.318, 24.436),
     "連江縣": (119.951, 26.160),
+}
+
+LEGACY_COUNTY_MAP: dict[str, str] = {
+    "臺北縣": "新北市",
+    "桃園縣": "桃園市",
+    "臺中縣": "臺中市",
+    "臺南縣": "臺南市",
+    "高雄縣": "高雄市",
+}
+
+CAPITAL_CITY_COUNTY: dict[str, str] = {
+    "南投市": "南投縣",
+    "彰化市": "彰化縣",
+    "苗栗市": "苗栗縣",
+    "斗六市": "雲林縣",
+    "太保市": "嘉義縣",
+    "朴子市": "嘉義縣",
+    "宜蘭市": "宜蘭縣",
+    "花蓮市": "花蓮縣",
+    "臺東市": "臺東縣",
+    "馬公市": "澎湖縣",
+    "竹北市": "新竹縣",
 }
 
 DISTRICT_ANCHORS: dict[str, tuple[float, float, float]] = {
@@ -180,71 +208,239 @@ DISTRICT_ANCHORS: dict[str, tuple[float, float, float]] = {
     "臺東市": (121.143, 22.758, 0.022),
 }
 
-# English address patterns for TPEx OTC companies
-ENG_COUNTY_PATTERNS = [
-    (r"NEW\s*TAI\w*", "新北市"),
-    (r"SI\s*JHIH|XIZHI|ZHONGHE|CHUNG\s*-?\s*HO|YONGHE|BANQIAO|PANCHIAO|XINDIAN|HSIN\s*-?\s*TIEN|TUCHENG|SHULIN|SANCHONG|XINZHUANG|WUGU|LINKOU", "新北市"),
-    (r"TAI\s*PEI|NEI\s*-?\s*HU|NANGANG|XINYI|DAAN|ZHONGSHAN|ZHONGZHENG|SONGSHAN|SHILIN|BEITOU", "臺北市"),
-    (r"KEELUNG", "基隆市"),
-    (r"TAO\s*-?\s*YUAN|CHUNG\s*-?\s*LI|ZHONGLI|YANG\s*MEI|KUEI\s*SHAN|GUISHAN|PING\s*-?\s*CHEN|LUZHU|DAYUAN", "桃園市"),
-    (r"(?:ZHU|CHU)\s*-?\s*BEI|(?:ZHU|CHU)\s*-?\s*PEI|HU\s*-?\s*KOU|HSIN\s*-?\s*CHI?U\s+(?:COUNTY|HSIEN)", "新竹縣"),
-    (r"HSIN\s*-?\s*CHU|SCIENCE[- ]BASED\s+INDUSTRIAL\s+PARK", "新竹市"),
-    (r"MIAO\s*-?\s*LI|CHU\s*-?\s*NAN|ZHUNAN", "苗栗縣"),
-    (r"TAI\s*-?\s*CHUNG|XITUN|NANTUN|BEITUN|DAYA|DALI|TANZI|FENGYUAN|SHENKANG", "臺中市"),
-    (r"CHANG\s*-?\s*HUA|LUGANG|YUANLIN", "彰化縣"),
+# County-scoped anchors for districts that exist in more than one county
+COUNTY_DISTRICT_ANCHORS: dict[tuple[str, str], tuple[float, float, float]] = {
+    ("臺北市", "中正區"): (121.519, 25.039, 0.010),
+    ("基隆市", "中正區"): (121.758, 25.145, 0.012),
+    ("臺北市", "中山區"): (121.533, 25.064, 0.012),
+    ("基隆市", "中山區"): (121.732, 25.145, 0.012),
+    ("臺北市", "信義區"): (121.567, 25.033, 0.011),
+    ("基隆市", "信義區"): (121.766, 25.131, 0.012),
+    ("臺北市", "大安區"): (121.543, 25.026, 0.011),
+    ("臺中市", "大安區"): (120.587, 24.366, 0.014),
+}
+
+DISTRICT_COUNTY_MAP: dict[str, tuple[str, ...]] = {
+    "內湖區": ("臺北市",),
+    "南港區": ("臺北市",),
+    "松山區": ("臺北市",),
+    "大同區": ("臺北市",),
+    "萬華區": ("臺北市",),
+    "士林區": ("臺北市",),
+    "北投區": ("臺北市",),
+    "文山區": ("臺北市",),
+    "信義區": ("臺北市", "基隆市"),
+    "大安區": ("臺北市", "臺中市"),
+    "中山區": ("臺北市", "基隆市"),
+    "中正區": ("臺北市", "基隆市"),
+    "汐止區": ("新北市",),
+    "板橋區": ("新北市",),
+    "中和區": ("新北市",),
+    "永和區": ("新北市",),
+    "新店區": ("新北市",),
+    "三重區": ("新北市",),
+    "新莊區": ("新北市",),
+    "五股區": ("新北市",),
+    "土城區": ("新北市",),
+    "樹林區": ("新北市",),
+    "林口區": ("新北市",),
+    "淡水區": ("新北市",),
+    "蘆洲區": ("新北市",),
+    "龜山區": ("桃園市",),
+    "桃園區": ("桃園市",),
+    "中壢區": ("桃園市",),
+    "蘆竹區": ("桃園市",),
+    "大園區": ("桃園市",),
+    "平鎮區": ("桃園市",),
+    "楊梅區": ("桃園市",),
+    "八德區": ("桃園市",),
+    "新竹科學園區": ("新竹市", "新竹縣"),
+    "竹北市": ("新竹縣",),
+    "竹東鎮": ("新竹縣",),
+    "湖口鄉": ("新竹縣",),
+    "新豐鄉": ("新竹縣",),
+    "竹南鎮": ("苗栗縣",),
+    "頭份市": ("苗栗縣",),
+    "西屯區": ("臺中市",),
+    "南屯區": ("臺中市",),
+    "北屯區": ("臺中市",),
+    "大雅區": ("臺中市",),
+    "大里區": ("臺中市",),
+    "太平區": ("臺中市",),
+    "豐原區": ("臺中市",),
+    "潭子區": ("臺中市",),
+    "神岡區": ("臺中市",),
+    "沙鹿區": ("臺中市",),
+    "彰化市": ("彰化縣",),
+    "員林市": ("彰化縣",),
+    "新市區": ("臺南市",),
+    "善化區": ("臺南市",),
+    "永康區": ("臺南市",),
+    "安南區": ("臺南市",),
+    "仁德區": ("臺南市",),
+    "歸仁區": ("臺南市",),
+    "安平區": ("臺南市",),
+    "前鎮區": ("高雄市",),
+    "苓雅區": ("高雄市",),
+    "鼓山區": ("高雄市",),
+    "左營區": ("高雄市",),
+    "三民區": ("高雄市",),
+    "楠梓區": ("高雄市",),
+    "小港區": ("高雄市",),
+    "仁武區": ("高雄市",),
+    "岡山區": ("高雄市",),
+    "路竹區": ("高雄市",),
+    "大寮區": ("高雄市",),
+    "鳳山區": ("高雄市",),
+    "宜蘭市": ("宜蘭縣",),
+    "羅東鎮": ("宜蘭縣",),
+    "蘇澳鎮": ("宜蘭縣",),
+    "花蓮市": ("花蓮縣",),
+    "吉安鄉": ("花蓮縣",),
+    "臺東市": ("臺東縣",),
+}
+
+_ROAD_FOLLOW_GUARD = r"(?!\s*(?:[NSEW]\.?\s*)?(?:RD|ROAD|ST|STREET|AVE|AVENUE|BLVD|LN|LANE|ALLEY|ALY|SEC|SECTION|VIL|VILLAGE)\b)"
+
+_ROAD_PREFIX = r"(?:\b|(?<=RD)|(?<=ROAD)|(?<=ST)|(?<=STREET)|(?<=LN)|(?<=LANE)|(?<=AVE)|(?<=BLVD)|(?<=PARK)|(?<=DIST)|(?<=TOWNSHIP))"
+
+# English address patterns for TPEx OTC companies:
+# Pass 1: explicit full county/city names first; Pass 2: district/township tokens; Pass 3: bare city/park tokens.
+ENG_COUNTY_PATTERNS: list[tuple[str, str]] = [
+    # Pass 1: Explicit full county/city names
+    (r"NEW\s*TAIP[EI]{1,3}|NEW\s*TAI\w*|TAIPEI\s*(?:COUNTY|HSIEN|HSIEH)", "新北市"),
+    (r"HSIN\s*-?\s*CH[IU]\s+(?:COUNTY|HSIEN)", "新竹縣"),
+    (r"HSIN\s*-?\s*CH[IU]\s+CITY", "新竹市"),
+    (r"CHIA\s*-?\s*YI\s+(?:COUNTY|HSIEN)", "嘉義縣"),
+    (r"CHIA\s*-?\s*YI\s+CITY", "嘉義市"),
+    (r"TAO\s*-?\s*YUAN", "桃園市"),
+    (r"K[AO][OA]SH?IUNG|KAO\s*HSIUNG|KAOSHSIUNG|KOAHSIUNG", "高雄市"),
+    (r"TAI\s*-?\s*NAN|\bTAIN\b|\bTAIN\s*$", "臺南市"),
+    (r"TAI\s*-?\s*CHUNG", "臺中市"),
+    (r"MIAO\s*-?\s*LI", "苗栗縣"),
+    (r"CHANG\s*-?\s*HUA", "彰化縣"),
     (r"NAN\s*-?\s*TOU", "南投縣"),
-    (r"YUN\s*-?\s*LIN|DOU\s*-?\s*L[EI]U", "雲林縣"),
-    (r"CHIA\s*-?\s*YI.*(?:COUNTY|HSIEN|MINXIONG)|MINXIONG", "嘉義縣"),
-    (r"CHIA\s*-?\s*YI", "嘉義市"),
-    (r"TAI\s*-?\s*NAN|\bTAIN\b|XINSHI|SHANHUA|YONGKANG|ANNAN|RENDE|GUIREN", "臺南市"),
-    (r"K[AO][OA]SH?IUNG|KAO\s*HSIUNG|QIANZHEN|NANZIH|NANZI|GUSHAN|LINGYA|SANMIN|ZUOYING|XIAOGANG|RENWU|LUZHU.*KAOH", "高雄市"),
+    (r"YUNE?\s*-?\s*LIN", "雲林縣"),
     (r"PING\s*-?\s*TUNG", "屏東縣"),
-    (r"Y?I\s*-?\s*LAN", "宜蘭縣"),
+    (r"KEELUNG", "基隆市"),
+    (rf"{_ROAD_PREFIX}Y?I\s*-?\s*LAN\b", "宜蘭縣"),
     (r"HUA\s*-?\s*LIEN", "花蓮縣"),
     (r"TAI\s*-?\s*TUNG", "臺東縣"),
     (r"PENG\s*-?\s*HU", "澎湖縣"),
     (r"KIN\s*-?\s*MEN", "金門縣"),
+    (r"TAI\s*-?\s*PEI\s*CITY", "臺北市"),
+    # Pass 2: Unambiguous district/township tokens (before bare TAIPEI / HSINCHU / parks)
+    (
+        rf"{_ROAD_PREFIX}(?:SI\s*JHIH|XIZHI|HSI\s*-?\s*CHIH|SHI\s*-?\s*JI|SIJHIH|ZHONGHE|CHUNG\s*-?\s*HO|JHONGHE|JUNGHE|YONGHE|BANQIAO|PANCHIAO|XINDIAN|HSIN\s*-?\s*TIEN|SIN\s*-?\s*DIAN|SINDIAN|TUCHENG|TO\s*-?\s*CHEN|SHULIN|SANCHONG|SANCHUNG|XINZHUANG|HSIN\s*-?\s*CHUANG|WUGU|WU\s*-?\s*KU|LINKOU|SHEN\s*-?\s*KENG|DANSHUI|TAMSUI|JUIFANG)\b{_ROAD_FOLLOW_GUARD}",
+        "新北市",
+    ),
+    (
+        rf"{_ROAD_PREFIX}(?:(?:ZHU|CHU|JHU|JU)\s*-?\s*[BP]EI|HU\s*-?\s*KOU|HSIN\s*-?\s*F[EUO]NG|CHU\s*-?\s*TUNG|CHIUNG\s*LIN|BAO\s*-?\s*SHAN)\b{_ROAD_FOLLOW_GUARD}",
+        "新竹縣",
+    ),
+    (
+        rf"{_ROAD_PREFIX}(?:NEI\s*-?\s*HU|NAN\s*-?\s*[GK]ANG|SONG\s*-?\s*SHAN|SHI\s*-?\s*LIN|SHIH\s*-?\s*LIN|SELIN|BEI\s*-?\s*TOU|PEI\s*-?\s*TOU|WAN\s*-?\s*HUA|DA\s*-?\s*TONG)\b{_ROAD_FOLLOW_GUARD}",
+        "臺北市",
+    ),
+    (
+        rf"{_ROAD_PREFIX}(?:CHUNG\s*-?\s*LI|ZHONG\s*-?\s*LI|YANG\s*-?\s*MEI|KUEI\s*-?\s*SHAN|GUI\s*-?\s*SHAN|GUEI\s*-?\s*SHAN|KWEI\s*-?\s*SHAN|PING\s*-?\s*CHEN|PING\s*-?\s*ZHEN|PING\s*-?\s*JHEN|DA\s*-?\s*YUAN|LUNG\s*-?\s*TAN|LONG\s*-?\s*TAN|BA\s*-?\s*DE|PA\s*-?\s*TE|GUAN\s*-?\s*YIN)\b{_ROAD_FOLLOW_GUARD}",
+        "桃園市",
+    ),
+    (
+        rf"{_ROAD_PREFIX}(?:XI\s*-?\s*TUN|HSI\s*-?\s*TUN|SI\s*-?\s*TUN|NAN\s*-?\s*TUN|NUN\s*-?\s*TUN|BEI\s*-?\s*TUN|DA\s*-?\s*YA|TA\s*-?\s*YA|DA\s*-?\s*LI(?!AO)|TAN\s*-?\s*ZI|TAN\s*-?\s*TZU|FENG\s*-?\s*YUAN|SHEN\s*-?\s*KANG|SHEN\s*-?\s*GANG|DA\s*-?\s*JIA|TA\s*-?\s*CHIA)\b{_ROAD_FOLLOW_GUARD}",
+        "臺中市",
+    ),
+    (r"\b(?:MIN\s*-?\s*HSIUNG|MINXIONG|YI\s*-?\s*CHU)\b", "嘉義縣"),
+    (rf"{_ROAD_PREFIX}DOU\s*-?\s*L[EI]U\b", "雲林縣"),
+    (
+        rf"{_ROAD_PREFIX}(?:XIN\s*-?\s*SHI|HSIN\s*-?\s*SHI|SHAN\s*-?\s*H[UW]A|YONG\s*-?\s*KANG|AN\s*-?\s*NAN|REN\s*-?\s*DE|GUI\s*-?\s*REN|SHIN\s*-?\s*YING|HSIN\s*-?\s*YING)\b{_ROAD_FOLLOW_GUARD}",
+        "臺南市",
+    ),
+    (
+        rf"{_ROAD_PREFIX}(?:QIAN\s*-?\s*ZHEN|CHIEN\s*-?\s*ZHEN|CIANJHEN|NAN\s*-?\s*ZI[H]?|NAN\s*-?\s*TZ[EU]|GU\s*-?\s*SHAN|LING\s*-?\s*YA|SAN\s*-?\s*MIN|ZUO\s*-?\s*YING|XIAO\s*-?\s*GANG|HSIAO\s*-?\s*KANG|REN\s*-?\s*WU|DA\s*-?\s*LIAO|TA\s*-?\s*FA)\b{_ROAD_FOLLOW_GUARD}",
+        "高雄市",
+    ),
+    (r"\bLU\s*-?\s*GANG|LUGANG\b", "彰化縣"),
+    (r"\b(?:CHU|ZHU)\s*-?\s*NAN\b", "苗栗縣"),
+    # Pass 3: Bare city/county names and science parks
+    (r"TAI\s*-?\s*PEI", "臺北市"),
+    (rf"{_ROAD_PREFIX}HSIN\s*-?\s*CH[IU]\b|SCIENCE[- ]BASED\s+INDUSTRIAL\s+PARK|\bSBIP", "新竹市"),
+    (r"\bCHIA\s*-?\s*YI\b", "嘉義市"),
 ]
 
-ENG_DISTRICT_PATTERNS = [
-    (r"NEI\s*-?\s*HU", "內湖區"),
-    (r"NAN\s*-?\s*GANG", "南港區"),
-    (r"SONG\s*-?\s*SHAN", "松山區"),
-    (r"SI\s*JHIH|XIZHI", "汐止區"),
-    (r"XIN\s*-?\s*YI|HSIN\s*-?\s*YI", "信義區"),
-    (r"DA\s*-?\s*AN|TA\s*-?\s*AN", "大安區"),
-    (r"ZHONG\s*-?\s*SHAN|CHUNG\s*-?\s*SHAN", "中山區"),
-    (r"ZHONG\s*-?\s*ZHENG|CHUNG\s*-?\s*CHENG", "中正區"),
-    (r"SHI\s*-?\s*LIN|SHIH\s*-?\s*LIN", "士林區"),
-    (r"BEI\s*-?\s*TOU|PEI\s*-?\s*TOU", "北投區"),
-    (r"BAN\s*-?\s*QIAO|PAN\s*-?\s*CHIAO", "板橋區"),
-    (r"ZHONG\s*-?\s*HE|CHUNG\s*-?\s*HO", "中和區"),
-    (r"XIN\s*-?\s*DIAN|HSIN\s*-?\s*TIEN", "新店區"),
-    (r"SAN\s*-?\s*CHONG|SAN\s*-?\s*CHUNG", "三重區"),
-    (r"XIN\s*-?\s*ZHUANG|HSIN\s*-?\s*CHUANG", "新莊區"),
-    (r"WU\s*-?\s*GU|WU\s*-?\s*KU", "五股區"),
-    (r"TU\s*-?\s*CHENG", "土城區"),
-    (r"SHU\s*-?\s*LIN", "樹林區"),
-    (r"GUI\s*-?\s*SHAN|KUEI\s*-?\s*SHAN", "龜山區"),
-    (r"CHUNG\s*-?\s*LI|ZHONG\s*-?\s*LI", "中壢區"),
-    (r"YANG\s*-?\s*MEI", "楊梅區"),
-    (r"PING\s*-?\s*ZHEN|PING\s*-?\s*CHEN", "平鎮區"),
-    (r"SCIENCE[- ]BASED\s+INDUSTRIAL\s+PARK|HSINCHU\s+SCIENCE\s+PARK", "新竹科學園區"),
-    (r"(?:ZHU|CHU)\s*-?\s*(?:BEI|PEI)", "竹北市"),
-    (r"HU\s*-?\s*KOU", "湖口鄉"),
-    (r"(?:ZHU|CHU)\s*-?\s*NAN", "竹南鎮"),
-    (r"XI\s*-?\s*TUN|HSI\s*-?\s*TUN", "西屯區"),
-    (r"NAN\s*-?\s*TUN", "南屯區"),
-    (r"DA\s*-?\s*YA", "大雅區"),
-    (r"TAN\s*-?\s*ZI", "潭子區"),
-    (r"XIN\s*-?\s*SHI", "新市區"),
-    (r"SHAN\s*-?\s*HUA", "善化區"),
-    (r"YONG\s*-?\s*KANG|YUNG\s*-?\s*KANG", "永康區"),
-    (r"AN\s*-?\s*NAN", "安南區"),
-    (r"QIAN\s*-?\s*ZHEN|CHIEN\s*-?\s*CHEN", "前鎮區"),
-    (r"NAN\s*-?\s*ZI|NAN\s*-?\s*TZU", "楠梓區"),
-    (r"GU\s*-?\s*SHAN|KU\s*-?\s*SHAN", "鼓山區"),
-    (r"ZUO\s*-?\s*YING|TSO\s*-?\s*YING", "左營區"),
+_DIST_BOUNDARY = r"(?:\s*[-\s]?(?:DIST(?:RICT)?|TOWNSHIP|CITY|TOWN|HSIANG|CHIU)\b)"
+_ROAD_DIST_BOUNDARY = r"(?:\s*[-\s]?(?:DIST(?:RICT)?|TOWNSHIP|HSIANG|CHIU)\b)"
+
+# (pattern, district_name, allowed_counties_or_None)
+# Street-prone names require explicit district/township/city boundary or are guarded against road suffixes.
+ENG_DISTRICT_PATTERNS: list[tuple[str, str, tuple[str, ...] | None]] = [
+    (rf"{_ROAD_PREFIX}(?:NEI\s*-?\s*HU)\b{_ROAD_FOLLOW_GUARD}", "內湖區", ("臺北市",)),
+    (rf"{_ROAD_PREFIX}(?:NAN\s*-?\s*[GK]ANG)\b{_ROAD_FOLLOW_GUARD}", "南港區", ("臺北市",)),
+    (rf"{_ROAD_PREFIX}(?:SONG\s*-?\s*SHAN)\b{_ROAD_FOLLOW_GUARD}", "松山區", ("臺北市",)),
+    (rf"{_ROAD_PREFIX}(?:SI\s*JHIH|XIZHI|HSI\s*-?\s*CHIH|SIJHIH)\b{_ROAD_FOLLOW_GUARD}", "汐止區", ("新北市",)),
+    (rf"{_ROAD_PREFIX}(?:XIN\s*-?\s*YI|HSIN\s*-?\s*YI){_DIST_BOUNDARY}", "信義區", ("臺北市", "基隆市")),
+    (rf"{_ROAD_PREFIX}(?:DA\s*-?\s*AN|TA\s*-?\s*AN){_DIST_BOUNDARY}", "大安區", ("臺北市", "臺中市")),
+    (rf"{_ROAD_PREFIX}(?:Z?HONG\s*-?\s*SHAN|CHUNG\s*-?\s*SHAN){_DIST_BOUNDARY}", "中山區", ("臺北市", "基隆市")),
+    (rf"{_ROAD_PREFIX}(?:ZHONG\s*-?\s*ZHENG|CHUNG\s*-?\s*CHENG|JHONG\s*-?\s*JHENG){_DIST_BOUNDARY}", "中正區", ("臺北市", "基隆市")),
+    (rf"{_ROAD_PREFIX}(?:SHI\s*-?\s*LIN|SHIH\s*-?\s*LIN|SELIN)\b{_ROAD_FOLLOW_GUARD}", "士林區", ("臺北市",)),
+    (rf"{_ROAD_PREFIX}(?:BEI\s*-?\s*TOU|PEI\s*-?\s*TOU)\b{_ROAD_FOLLOW_GUARD}", "北投區", ("臺北市",)),
+    (rf"{_ROAD_PREFIX}(?:DA\s*-?\s*TONG){_DIST_BOUNDARY}", "大同區", ("臺北市",)),
+    (rf"{_ROAD_PREFIX}(?:WAN\s*-?\s*HUA)\b{_ROAD_FOLLOW_GUARD}", "萬華區", ("臺北市",)),
+    (rf"{_ROAD_PREFIX}(?:BAN\s*-?\s*QIAO|PAN\s*-?\s*CHIAO)\b{_ROAD_FOLLOW_GUARD}", "板橋區", ("新北市",)),
+    (rf"{_ROAD_PREFIX}(?:ZHONG\s*-?\s*HE|CHUNG\s*-?\s*HO|JHONG\s*-?\s*HE|JUNG\s*-?\s*HE){_DIST_BOUNDARY}", "中和區", ("新北市",)),
+    (rf"{_ROAD_PREFIX}(?:YONG\s*-?\s*HE)\b{_ROAD_FOLLOW_GUARD}", "永和區", ("新北市",)),
+    (rf"{_ROAD_PREFIX}(?:XIN\s*-?\s*DIAN|HSIN\s*-?\s*TIEN|SIN\s*-?\s*DIAN|SINDIAN)\b{_ROAD_FOLLOW_GUARD}", "新店區", ("新北市",)),
+    (rf"{_ROAD_PREFIX}(?:SAN\s*-?\s*CHONG|SAN\s*-?\s*CHUNG)\b{_ROAD_FOLLOW_GUARD}", "三重區", ("新北市",)),
+    (rf"{_ROAD_PREFIX}(?:XIN\s*-?\s*ZHUANG|HSIN\s*-?\s*CHUANG)\b{_ROAD_FOLLOW_GUARD}", "新莊區", ("新北市",)),
+    (rf"{_ROAD_PREFIX}(?:WU\s*-?\s*GU|WU\s*-?\s*KU)\b{_ROAD_FOLLOW_GUARD}", "五股區", ("新北市",)),
+    (rf"{_ROAD_PREFIX}(?:TU\s*-?\s*CHENG|TO\s*-?\s*CHEN)\b{_ROAD_FOLLOW_GUARD}", "土城區", ("新北市",)),
+    (rf"{_ROAD_PREFIX}(?:SHU\s*-?\s*LIN)\b{_ROAD_FOLLOW_GUARD}", "樹林區", ("新北市",)),
+    (rf"{_ROAD_PREFIX}(?:LIN\s*-?\s*KOU)\b{_ROAD_FOLLOW_GUARD}", "林口區", ("新北市",)),
+    (rf"{_ROAD_PREFIX}(?:DAN\s*-?\s*SHUI|TAM\s*-?\s*SUI)\b{_ROAD_FOLLOW_GUARD}", "淡水區", ("新北市",)),
+    (rf"{_ROAD_PREFIX}(?:GUI\s*-?\s*SHAN|KUEI\s*-?\s*SHAN|GUEI\s*-?\s*SHAN|KWEI\s*-?\s*SHAN)\b{_ROAD_FOLLOW_GUARD}", "龜山區", ("桃園市",)),
+    (rf"{_ROAD_PREFIX}(?:CHUNG\s*-?\s*LI|ZHONG\s*-?\s*LI)\b{_ROAD_FOLLOW_GUARD}", "中壢區", ("桃園市",)),
+    (rf"{_ROAD_PREFIX}(?:YANG\s*-?\s*MEI)\b{_ROAD_FOLLOW_GUARD}", "楊梅區", ("桃園市",)),
+    (rf"{_ROAD_PREFIX}(?:PING\s*-?\s*ZHEN|PING\s*-?\s*CHEN|PING\s*-?\s*JHEN)\b{_ROAD_FOLLOW_GUARD}", "平鎮區", ("桃園市",)),
+    (rf"{_ROAD_PREFIX}(?:LU\s*-?\s*[CZ]HU|LUJHU)\b{_ROAD_FOLLOW_GUARD}", "蘆竹區", ("桃園市",)),
+    (rf"{_ROAD_PREFIX}(?:LU\s*-?\s*[CZ]HU|LUJHU)\b{_ROAD_FOLLOW_GUARD}", "路竹區", ("高雄市",)),
+    (rf"{_ROAD_PREFIX}(?:DA\s*-?\s*YUAN)\b{_ROAD_FOLLOW_GUARD}", "大園區", ("桃園市",)),
+    (rf"{_ROAD_PREFIX}(?:GUAN\s*-?\s*YIN)\b{_ROAD_FOLLOW_GUARD}", "觀音區", ("桃園市",)),
+    (rf"{_ROAD_PREFIX}(?:LUNG\s*-?\s*TAN|LONG\s*-?\s*TAN)\b{_ROAD_FOLLOW_GUARD}", "龍潭區", ("桃園市",)),
+    (rf"{_ROAD_PREFIX}(?:BA\s*-?\s*DE|PA\s*-?\s*TE)\b{_ROAD_FOLLOW_GUARD}", "八德區", ("桃園市",)),
+    (rf"{_ROAD_PREFIX}(?:TAO\s*-?\s*YUAN){_ROAD_DIST_BOUNDARY}", "桃園區", ("桃園市",)),
+    (rf"\b(?:ZHU|CHU|JHU|JU)\s*-?\s*(?:BEI|PEI)\b{_ROAD_FOLLOW_GUARD}", "竹北市", ("新竹縣",)),
+    (rf"\b(?:HU\s*-?\s*KOU)\b{_ROAD_FOLLOW_GUARD}", "湖口鄉", ("新竹縣",)),
+    (rf"\b(?:HSIN\s*-?\s*F[EUO]NG)\b{_ROAD_FOLLOW_GUARD}", "新豐鄉", ("新竹縣",)),
+    (rf"\b(?:ZHU|CHU)\s*-?\s*NAN\b{_ROAD_FOLLOW_GUARD}", "竹南鎮", ("苗栗縣",)),
+    (rf"\b(?:TOU\s*-?\s*FEN)\b{_ROAD_FOLLOW_GUARD}", "頭份市", ("苗栗縣",)),
+    (rf"\b(?:TONG\s*-?\s*LUO)\b{_ROAD_FOLLOW_GUARD}", "銅鑼鄉", ("苗栗縣",)),
+    (rf"\b(?:XI\s*-?\s*TUN|HSI\s*-?\s*TUN|SI\s*-?\s*TUN)\b{_ROAD_FOLLOW_GUARD}", "西屯區", ("臺中市",)),
+    (rf"\b(?:NAN\s*-?\s*TUN|NUN\s*-?\s*TUN)\b{_ROAD_FOLLOW_GUARD}", "南屯區", ("臺中市",)),
+    (rf"\b(?:BEI\s*-?\s*TUN)\b{_ROAD_FOLLOW_GUARD}", "北屯區", ("臺中市",)),
+    (rf"\b(?:DA\s*-?\s*YA|TA\s*-?\s*YA)\b{_ROAD_FOLLOW_GUARD}", "大雅區", ("臺中市",)),
+    (rf"\b(?:DA\s*-?\s*LI)\b{_ROAD_FOLLOW_GUARD}", "大里區", ("臺中市",)),
+    (rf"\b(?:TAI\s*-?\s*PING)\b{_ROAD_FOLLOW_GUARD}", "太平區", ("臺中市",)),
+    (rf"\b(?:TAN\s*-?\s*ZI|TAN\s*-?\s*TZU)\b{_ROAD_FOLLOW_GUARD}", "潭子區", ("臺中市",)),
+    (rf"\b(?:SHEN\s*-?\s*GANG|SHEN\s*-?\s*KANG)\b{_ROAD_FOLLOW_GUARD}", "神岡區", ("臺中市",)),
+    (rf"\b(?:XIN\s*-?\s*SHI|HSIN\s*-?\s*SHI)\b{_ROAD_FOLLOW_GUARD}", "新市區", ("臺南市",)),
+    (rf"\b(?:SHAN\s*-?\s*H[UW]A)\b{_ROAD_FOLLOW_GUARD}", "善化區", ("臺南市",)),
+    (rf"\b(?:YONG\s*-?\s*KANG|YUNG\s*-?\s*KANG)\b{_ROAD_FOLLOW_GUARD}", "永康區", ("臺南市",)),
+    (rf"\b(?:AN\s*-?\s*NAN)\b{_ROAD_FOLLOW_GUARD}", "安南區", ("臺南市",)),
+    (rf"\b(?:REN\s*-?\s*DE)\b{_ROAD_FOLLOW_GUARD}", "仁德區", ("臺南市",)),
+    (rf"\b(?:GUI\s*-?\s*REN)\b{_ROAD_FOLLOW_GUARD}", "歸仁區", ("臺南市",)),
+    (rf"\b(?:AN\s*-?\s*PING)\b{_ROAD_FOLLOW_GUARD}", "安平區", ("臺南市",)),
+    (rf"\b(?:QIAN\s*-?\s*ZHEN|CHIEN\s*-?\s*CHEN|CIAN\s*-?\s*JHEN)\b{_ROAD_FOLLOW_GUARD}", "前鎮區", ("高雄市",)),
+    (rf"\b(?:LING\s*-?\s*YA)\b{_ROAD_FOLLOW_GUARD}", "苓雅區", ("高雄市",)),
+    (rf"\b(?:GU\s*-?\s*SHAN|KU\s*-?\s*SHAN)\b{_ROAD_FOLLOW_GUARD}", "鼓山區", ("高雄市",)),
+    (rf"\b(?:ZUO\s*-?\s*YING|TSO\s*-?\s*YING)\b{_ROAD_FOLLOW_GUARD}", "左營區", ("高雄市",)),
+    (rf"\b(?:SAN\s*-?\s*MIN)\b{_ROAD_FOLLOW_GUARD}", "三民區", ("高雄市",)),
+    (rf"\b(?:NAN\s*-?\s*ZI[H]?|NAN\s*-?\s*TZ[EU])\b{_ROAD_FOLLOW_GUARD}", "楠梓區", ("高雄市",)),
+    (rf"\b(?:HSIAO\s*-?\s*KANG|XIAO\s*-?\s*GANG)\b{_ROAD_FOLLOW_GUARD}", "小港區", ("高雄市",)),
+    (rf"\b(?:REN\s*-?\s*WUU?)\b{_ROAD_FOLLOW_GUARD}", "仁武區", ("高雄市",)),
+    (rf"\b(?:KANG\s*-?\s*SHAN|GANG\s*-?\s*SHAN)\b{_ROAD_FOLLOW_GUARD}", "岡山區", ("高雄市",)),
+    (rf"\b(?:DA\s*-?\s*LIAO)\b{_ROAD_FOLLOW_GUARD}", "大寮區", ("高雄市",)),
+    (rf"\b(?:FENG\s*-?\s*SHAN)\b{_ROAD_FOLLOW_GUARD}", "鳳山區", ("高雄市",)),
+    (rf"\b(?:SU\s*-?\s*AO)\b{_ROAD_FOLLOW_GUARD}", "蘇澳鎮", ("宜蘭縣",)),
 ]
 
 # Official TWSE/TPEx industry code mapping into 8 PoC sectors
@@ -263,14 +459,14 @@ TWSE_INDUSTRY_MAP = {
     "17": "金融控股與投資",     # 金融保險業
     "14": "營造工程與不動產",    # 建材營造
     "16": "餐飲旅宿與生活文創",  # 觀光餐旅
-    "04": "餐飲旅宿與生活文創",  # 食品工業
+    "04": "精密機械與傳統製造",  # 紡織纖維
     "32": "餐飲旅宿與生活文創",  # 文化創意業
-    "37": "餐飲旅宿與生活文創",  # 運動休閒
-    "15": "批發零售與國際貿易",  # 航運業
+    "37": "精密機械與傳統製造",  # 運動休閒（自行車、製鞋、運動器材製造為主；場館/健身另判）
+    "15": "批發零售與國際貿易",  # 航運業（航太/造船另判精密機械與傳統製造）
     "18": "批發零售與國際貿易",  # 貿易百貨
     "38": "批發零售與國際貿易",  # 居家生活
     "01": "精密機械與傳統製造",  # 水泥工業
-    "02": "餐飲旅宿與生活文創",  # 食品
+    "02": "餐飲旅宿與生活文創",  # 食品工業
     "03": "精密機械與傳統製造",  # 塑膠工業
     "05": "精密機械與傳統製造",  # 電機機械
     "06": "精密機械與傳統製造",  # 電器電纜
@@ -401,12 +597,26 @@ INDUSTRIES = [
 ]
 
 
+def normalize_tw_text(s: str) -> str:
+    out = (s or "").replace("\u5dff", "市").replace("台", "臺").strip()
+    for old, new in LEGACY_COUNTY_MAP.items():
+        out = out.replace(old, new)
+    return out
+
+
 def load_taiwan_geojson() -> dict[str, Any]:
-    text = GEO_MAPS_JS.read_text(encoding="utf-8")
-    m = re.search(r"const TAIWAN_GEOJSON\s*=\s*(\{.*?\});", text, re.S)
-    if not m:
-        raise RuntimeError("Could not find TAIWAN_GEOJSON in universal_geo_maps.js")
-    return json.loads(m.group(1))
+    if GEO_MAPS_JS.exists():
+        text = GEO_MAPS_JS.read_text(encoding="utf-8")
+        m = re.search(r"const TAIWAN_GEOJSON\s*=\s*(\{.*?\});", text, re.S)
+        if m:
+            return json.loads(m.group(1))
+    for html_path in (POC_HTML, INDEX_HTML):
+        if html_path.exists():
+            text = html_path.read_text(encoding="utf-8")
+            m = re.search(r"window\.__TAIWAN_GEOJSON__\s*=\s*(\{.*?\});", text)
+            if m:
+                return json.loads(m.group(1))
+    raise RuntimeError("Could not find TAIWAN_GEOJSON in js/universal_geo_maps.js or HTML files")
 
 
 def point_in_ring(x: float, y: float, ring: list[list[float]]) -> bool:
@@ -438,15 +648,22 @@ def point_in_feature(lon: float, lat: float, feat: dict[str, Any]) -> bool:
 def build_county_poly_index(geojson: dict[str, Any]) -> dict[str, dict[str, Any]]:
     idx = {}
     for feat in geojson["features"]:
-        name = feat["properties"].get("COUNTYNAME") or feat["properties"].get("name")
+        props = feat.get("properties") or {}
+        name = props.get("name") or props.get("COUNTYNAME")
         if name:
-            norm = name.replace("台", "臺")
+            norm = normalize_tw_text(name)
             idx[norm] = feat
             idx[name] = feat
+            if props.get("COUNTYNAME"):
+                raw_cn = str(props["COUNTYNAME"])
+                idx[raw_cn] = feat
+                idx[normalize_tw_text(raw_cn)] = feat
     return idx
 
 
 def fetch_json(url: str, retries: int = 2, timeout: int = 16) -> list[dict[str, Any]]:
+    host = urllib.parse.urlsplit(url).netloc
+    use_unverified = False
     for attempt in range(retries + 1):
         try:
             req = urllib.request.Request(
@@ -456,12 +673,26 @@ def fetch_json(url: str, retries: int = 2, timeout: int = 16) -> list[dict[str, 
                     "Accept": "application/json",
                 },
             )
-            with urllib.request.urlopen(req, context=SSL_CTX, timeout=timeout) as resp:
+            ctx = SSL_CTX_UNVERIFIED if use_unverified else SSL_CTX
+            with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
                 raw = resp.read().decode("utf-8", errors="replace").strip()
                 if not raw:
                     return []
                 data = json.loads(raw)
                 return data if isinstance(data, list) else []
+        except (ssl.SSLError, urllib.error.URLError) as exc:
+            is_ssl = isinstance(exc, ssl.SSLError) or (
+                isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, ssl.SSLError)
+            )
+            if is_ssl and not use_unverified:
+                with _TLS_WARN_LOCK:
+                    if host not in _TLS_WARNED_HOSTS:
+                        _TLS_WARNED_HOSTS.add(host)
+                        print(f"[TLS] Verification failed for {host} ({exc}); falling back to unverified SSL context")
+                use_unverified = True
+                continue
+            if attempt < retries:
+                time.sleep(0.4 * (attempt + 1))
         except Exception:
             if attempt < retries:
                 time.sleep(0.4 * (attempt + 1))
@@ -708,12 +939,35 @@ def fetch_twse_tpex_stocks() -> tuple[dict[str, dict[str, Any]], str]:
 
 
 def parse_county_and_district(loc: str, reg_org: str) -> tuple[str, str]:
-    loc_norm = (loc or "").replace("台", "臺").strip()
-    reg_norm = (reg_org or "").replace("台", "臺").strip()
+    loc_norm = normalize_tw_text(loc)
+    reg_norm = normalize_tw_text(reg_org)
     loc_upper = (loc or "").upper()
 
     # Explicitly exclude Cayman Islands / foreign domiciles with no Taiwan address
-    if any(k in loc_upper for k in ("CAYMAN", "SAMOA", "VIRGIN ISLANDS", "SINGAPORE", "RAYONG")) and not any(c in loc_norm for c in COUNTY_CENTROIDS):
+    foreign_tokens = (
+        "CAYMAN",
+        "SAMOA",
+        "VIRGIN ISLANDS",
+        "SINGAPORE",
+        "RAYONG",
+        "THAILAND",
+        "MALAYSIA",
+        "VIETNAM",
+        "CALIFORNIA",
+        "U.S.A",
+        "UNITED STATES",
+        "INDONESIA",
+        "HONG KONG",
+        "CAMBODIA",
+        "PHILIPPINES",
+        "GRAND PAVILION",
+        "UGLAND HOUSE",
+        "NORTH SOUND",
+    )
+    if (
+        any(k in loc_upper for k in foreign_tokens)
+        or re.search(r"\b(?:USA|MACAU|JAPAN|CHINA)\b", loc_upper)
+    ) and not any(c in loc_norm for c in COUNTY_CENTROIDS):
         return "", ""
 
     county = ""
@@ -721,8 +975,21 @@ def parse_county_and_district(loc: str, reg_org: str) -> tuple[str, str]:
         if c in loc_norm:
             county = c
             break
+
+    loc_nopost = re.sub(r"^[\(\[（【]?\d{3,6}[\)\]）】]?\s*", "", loc_norm)
     if not county:
-        if "新竹科學園區" in loc_norm or "新竹科學園區" in reg_norm:
+        if loc_nopost.startswith("北市"):
+            county = "臺北市"
+        elif loc_nopost.startswith("板橋區"):
+            county = "新北市"
+        else:
+            for city_name, c_name in CAPITAL_CITY_COUNTY.items():
+                if city_name in loc_norm:
+                    county = c_name
+                    break
+
+    if not county:
+        if "新竹科學工業園區" in loc_norm or "新竹科學園區" in loc_norm or "新竹科學園區" in reg_norm:
             county = "新竹市"
         elif "中部科學園區" in loc_norm or "中部科學園區" in reg_norm:
             county = "臺中市"
@@ -730,9 +997,14 @@ def parse_county_and_district(loc: str, reg_org: str) -> tuple[str, str]:
             county = "臺南市"
         else:
             for c in COUNTY_CENTROIDS:
-                if c[:2] in reg_norm:
+                if c in reg_norm:
                     county = c
                     break
+            if not county:
+                for c in COUNTY_CENTROIDS:
+                    if c[:2] in reg_norm:
+                        county = c
+                        break
 
     # Fallback: parse English romanized address (used by TPEx mopsfin_t187ap03_O)
     if not county and loc_upper:
@@ -745,22 +1017,48 @@ def parse_county_and_district(loc: str, reg_org: str) -> tuple[str, str]:
         return "", ""
 
     district = ""
-    if "新竹科學園區" in loc_norm or "新竹科學園區" in reg_norm:
-        district = "新竹科學園區"
-    else:
-        for d in DISTRICT_ANCHORS:
-            if d in loc_norm:
-                district = d
+    # 1. County-scoped Chinese district anchors (excluding 新竹科學園區 until specific townships are checked)
+    for d in DISTRICT_ANCHORS:
+        if d == "新竹科學園區":
+            continue
+        if county in DISTRICT_COUNTY_MAP.get(d, ()) and d in loc_norm:
+            district = d
+            break
+
+    if not district and loc_nopost.startswith("板橋區") and county == "新北市":
+        district = "板橋區"
+
+    if not district:
+        for city_name, c_name in CAPITAL_CITY_COUNTY.items():
+            if c_name == county and city_name in loc_norm:
+                district = city_name
                 break
-        if not district:
-            m = re.search(rf"{county[0]}.{{1,2}}[市縣](.{{1,3}}[區鄉鎮市])", loc_norm)
-            if m:
-                district = m.group(1)
-        if not district and loc_upper:
-            for pat, dname in ENG_DISTRICT_PATTERNS:
-                if re.search(pat, loc_upper):
-                    district = dname
-                    break
+
+    if not district:
+        m = re.search(rf"{county[0]}.{{1,2}}[市縣]([^\d\s路街段巷弄號樓]{{1,3}}?[區鄉鎮市])", loc_norm)
+        if m and m.group(1) not in ("科學園區", "工業區", "軟體園區"):
+            district = m.group(1)
+
+    # 2. County-scoped English district patterns
+    if not district and loc_upper:
+        for pat, dname, allowed_counties in ENG_DISTRICT_PATTERNS:
+            if allowed_counties is not None and county not in allowed_counties:
+                continue
+            if re.search(pat, loc_upper):
+                district = dname
+                break
+
+    # 3. Only fall back to 新竹科學園區 when county is 新竹市/新竹縣 and no specific township matched
+    if not district and county in ("新竹市", "新竹縣"):
+        if (
+            "新竹科學園區" in loc_norm
+            or "新竹科學工業園區" in loc_norm
+            or "新竹科學園區" in reg_norm
+            or "SCIENCE-BASED INDUSTRIAL PARK" in loc_upper
+            or "HSINCHU SCIENCE PARK" in loc_upper
+            or bool(re.search(r"\bSBIP", loc_upper))
+        ):
+            district = "新竹科學園區"
 
     return county, district
 
@@ -789,21 +1087,39 @@ def assign_cluster(county: str, district: str, loc: str) -> str:
 
 
 def classify_industry(name: str, reg_org: str = "", twse_ind_code: str = "") -> str:
-    if twse_ind_code and twse_ind_code in TWSE_INDUSTRY_MAP:
-        # Refine telecoms (中華電、台灣大、遠傳) & networking/cloud if needed
-        if any(k in name for k in ("軟體", "資訊", "數位", "雲端", "AI", "人工智慧", "中華電信", "台灣大哥大", "遠傳")):
-            return "AI與軟體資訊服務"
-        return TWSE_INDUSTRY_MAP[twse_ind_code]
+    if twse_ind_code:
+        if twse_ind_code == "37":
+            if any(k in name for k in ("大魯閣", "柏文", "健身", "邁達康")):
+                return "餐飲旅宿與生活文創"
+            return "精密機械與傳統製造"
+        if twse_ind_code == "15":
+            if any(k in name for k in ("漢翔", "台船", "造船", "航太", "航空工業", "亞航")):
+                return "精密機械與傳統製造"
+            return "批發零售與國際貿易"
+        if twse_ind_code in TWSE_INDUSTRY_MAP:
+            # Refine telecoms (中華電、台灣大、遠傳) & networking/cloud if needed
+            if (
+                any(k in name for k in ("軟體", "資訊", "數位", "雲端", "人工智慧", "中華電信", "台灣大哥大", "遠傳"))
+                or bool(re.search(r"(?<![A-Za-z])AI(?![A-Za-z])", name))
+            ):
+                return "AI與軟體資訊服務"
+            return TWSE_INDUSTRY_MAP[twse_ind_code]
 
-    if any(k in name for k in ("半導體", "積體電路", "晶圓", "光電", "光學", "電子", "面板", "封測", "元件", "電路板", "電腦", "聯電", "聯發", "宏碁", "和碩", "緯創", "緯穎", "台虹", "宏捷", "大立光", "科技", "通訊", "電通")):
+    # Unlisted classification: specific sectors BEFORE generic '科技' / '電子'
+    if any(k in name for k in ("半導體", "積體電路", "晶圓", "封測", "電路板", "被動元件", "聯電", "聯發", "和碩", "緯創", "緯穎", "台虹", "宏捷", "大立光", "晶相", "記憶體")):
         return "半導體與電子製造"
-    if any(k in name for k in ("軟體", "資訊", "數位", "網路", "雲端", "AI", "人工智慧", "系統", "資通", "數據", "電信", "線上", "遊戲", "大哥大", "智邦")):
-        return "AI與軟體資訊服務"
-    if any(k in name for k in ("生技", "生物科技", "生醫", "醫藥", "醫療", "藥業", "製藥", "健康", "綠能", "太陽能", "能源", "風電", "環保", "儲能", "潔淨", "永續")):
+    if any(k in name for k in ("生技", "生物科技", "生醫", "醫藥", "醫療", "藥業", "製藥", "健康", "疫苗", "基因", "綠能", "太陽能", "能源", "風電", "環保", "儲能", "潔淨", "永續", "水資源", "碳權")):
         return "生技醫療與綠能永續"
-    if any(k in name for k in ("金融", "金控", "銀行", "證券", "保險", "投資", "控股", "創投", "資產管理", "租賃", "票券", "期貨")):
+    if (
+        any(k in name for k in ("軟體", "資訊", "數位", "網路", "雲端", "人工智慧", "系統", "資通", "數據", "電信", "線上", "遊戲", "大哥大", "智邦", "資安", "網通"))
+        or bool(re.search(r"(?<![A-Za-z])AI(?![A-Za-z])", name))
+    ):
+        return "AI與軟體資訊服務"
+    if any(k in name for k in ("光電", "光學", "面板", "電腦", "電源", "連接器", "宏碁")):
+        return "半導體與電子製造"
+    if any(k in name for k in ("金融", "金控", "銀行", "證券", "保險", "投資", "控股", "創投", "資產管理", "租賃", "票券", "期貨", "保經")):
         return "金融控股與投資"
-    if any(k in name for k in ("機械", "精密", "工具機", "自動化", "五金", "鋼鐵", "金屬", "工業", "模具", "塑膠", "化學", "化工", "材料", "紡織", "電機", "航太", "漢翔", "奇美", "巨大", "造紙", "用紙", "水泥")):
+    if any(k in name for k in ("機械", "精密", "工具機", "自動化", "五金", "鋼鐵", "金屬", "工業", "模具", "塑膠", "化學", "化工", "材料", "紡織", "纖維", "染整", "成衣", "製鞋", "自行車", "電機", "航太", "造船", "漢翔", "台船", "奇美", "巨大", "美利達", "寶成", "造紙", "用紙", "水泥")):
         return "精密機械與傳統製造"
     if any(k in name for k in ("營造", "建設", "建築", "不動產", "地產", "工程顧問", "顧問", "開發", "機電")):
         return "營造工程與不動產"
@@ -811,24 +1127,28 @@ def classify_industry(name: str, reg_org: str = "", twse_ind_code: str = "") -> 
         return "餐飲旅宿與生活文創"
     if any(k in name for k in ("海運", "航運", "航空", "物流", "貨運", "倉儲", "通運", "運輸")):
         return "批發零售與國際貿易"
+    if any(k in name for k in ("電子", "科技", "通訊", "電通", "元件")):
+        return "半導體與電子製造"
     if "科學園區" in reg_org:
         return "半導體與電子製造"
     return "批發零售與國際貿易"
 
 
-def parse_setup_year(date_str: Any) -> int:
+def parse_setup_year(date_str: Any, current_year: int | None = None) -> int | None:
+    if current_year is None:
+        current_year = time.localtime().tm_year
     s = str(date_str or "").strip()
     digits = re.sub(r"\D", "", s)
     if len(digits) == 8 and digits.startswith(("19", "20")):
         year = int(digits[:4])
-        if 1945 <= year <= 2026:
+        if 1900 <= year <= current_year:
             return year
-    if len(digits) >= 6:
+    if len(digits) in (6, 7):
         roc_y = int(digits[:-4])
         year = 1911 + roc_y
-        if 1945 <= year <= 2026:
+        if 1900 <= year <= current_year:
             return year
-    return 2015
+    return None
 
 
 def deterministic_coord(
@@ -837,7 +1157,9 @@ def deterministic_coord(
     h = hashlib.sha256(ban.encode("utf-8")).digest()
     rng = random.Random(int.from_bytes(h[:8], "big"))
 
-    if district in DISTRICT_ANCHORS:
+    if (county, district) in COUNTY_DISTRICT_ANCHORS:
+        base_lon, base_lat, spread = COUNTY_DISTRICT_ANCHORS[(county, district)]
+    elif district in DISTRICT_ANCHORS and county in DISTRICT_COUNTY_MAP.get(district, ()):
         base_lon, base_lat, spread = DISTRICT_ANCHORS[district]
     else:
         base_lon, base_lat = COUNTY_CENTROIDS.get(county, (120.95, 23.75))
@@ -851,11 +1173,32 @@ def deterministic_coord(
             if feat is None or point_in_feature(lon, lat, feat):
                 return round(lon, 5), round(lat, 5)
     clon, clat = COUNTY_CENTROIDS.get(county, (base_lon, base_lat))
-    return round(clon + rng.uniform(-0.004, 0.004), 5), round(clat + rng.uniform(-0.004, 0.004), 5)
+    for _ in range(24):
+        lon = clon + rng.uniform(-0.008, 0.008)
+        lat = clat + rng.uniform(-0.008, 0.008)
+        if feat is None or point_in_feature(lon, lat, feat):
+            return round(lon, 5), round(lat, 5)
+    return round(clon, 5), round(clat, 5)
+
+
+def sync_payload_to_html(compact_json: str) -> None:
+    pattern = re.compile(r"^window\.__GCIS_DATA__\s*=\s*\{.*?\};[ \t]*$", re.MULTILINE)
+    replacement = f"window.__GCIS_DATA__ = {compact_json};"
+    for html_path in (POC_HTML, INDEX_HTML):
+        if not html_path.exists():
+            continue
+        text = html_path.read_text(encoding="utf-8")
+        if not pattern.search(text):
+            continue
+        new_text, count = pattern.subn(lambda _: replacement, text, count=1)
+        if count:
+            html_path.write_text(new_text, encoding="utf-8")
+            print(f"[SYNC] Updated window.__GCIS_DATA__ in {html_path}")
 
 
 def main() -> None:
     force_refresh = "--refresh-gcis" in sys.argv
+    sync_html = "--sync-html" in sys.argv
     geojson = load_taiwan_geojson()
     county_polys = build_county_poly_index(geojson)
     raw_records, verified_flagships = load_or_collect_gcis_records(force_refresh=force_refresh)
@@ -865,7 +1208,20 @@ def main() -> None:
     added_from_twse = 0
     for ban, st in stocks_by_ban.items():
         if ban not in raw_records:
-            county, _ = parse_county_and_district(st["address"], st["reg_org"])
+            addr = st["address"]
+            reg_org = st["reg_org"]
+            county, _ = parse_county_and_district(addr, reg_org)
+            if not county and not addr.strip():
+                # Fallback to GCIS BAN API when TWSE/TPEx has empty address (e.g. 3158 嘉實)
+                flt = urllib.parse.quote(f"Business_Accounting_NO eq {ban}")
+                gcis_rows = fetch_json(
+                    f"https://data.gcis.nat.gov.tw/od/data/api/{OID_BAN}?$format=json&$filter={flt}"
+                )
+                if gcis_rows:
+                    gr = gcis_rows[0]
+                    addr = str(gr.get("Company_Location") or "").strip()
+                    reg_org = str(gr.get("Register_Organization_Desc") or reg_org).strip()
+                    county, _ = parse_county_and_district(addr, reg_org)
             if not county:
                 continue
             raw_records[ban] = {
@@ -875,8 +1231,8 @@ def main() -> None:
                 "Paid_In_Capital_Amount": st["capital"],
                 "Capital_Stock_Amount": st["capital"],
                 "Company_Setup_Date": st["setup_date"],
-                "Company_Location": st["address"],
-                "Register_Organization_Desc": st["reg_org"],
+                "Company_Location": addr,
+                "Register_Organization_Desc": reg_org,
                 "Company_Status": "01",
             }
             added_from_twse += 1
@@ -889,7 +1245,7 @@ def main() -> None:
     print(f"[MERGE] Added {added_from_twse} additional domestic TWSE/TPEx listed/OTC companies (total pool: {len(raw_records)})")
 
     items: list[dict[str, Any]] = []
-    current_year = 2026
+    current_year = time.localtime().tm_year
 
     for ban, r in raw_records.items():
         name = str(r.get("Company_Name") or "").strip()
@@ -914,8 +1270,8 @@ def main() -> None:
         if capital <= 0:
             capital = 100000
 
-        setup_year = parse_setup_year(r.get("Company_Setup_Date"))
-        age = max(0, current_year - setup_year)
+        setup_year = parse_setup_year(r.get("Company_Setup_Date"), current_year=current_year)
+        age = max(0, current_year - setup_year) if setup_year is not None else None
 
         if capital < 1_000_000:
             cap_tier = "< 100萬 微型新創"
@@ -933,7 +1289,10 @@ def main() -> None:
             cap_tier = "≥ 5億 產業巨頭"
             cap_tier_idx = 4
 
-        if age <= 5:
+        if age is None:
+            age_tier = "穩健中堅 (年代未詳)"
+            age_tier_idx = 1
+        elif age <= 5:
             age_tier = "新創動能 (≤5年)"
             age_tier_idx = 3
         elif age <= 15:
@@ -1039,7 +1398,7 @@ def main() -> None:
         prs = sorted(x["pr"] for x in sub)
         med_pr = prs[len(prs) // 2] if prs else 0
         billion_plus = sum(1 for x in sub if x["capital"] >= 100_000_000)
-        recent_5y = sum(1 for x in sub if x["age"] <= 5)
+        recent_5y = sum(1 for x in sub if x["age"] is not None and x["age"] <= 5)
         listed_cnt = sum(1 for x in sub if x.get("stock") is not None)
         ind_counts: dict[str, int] = {ind: 0 for ind in INDUSTRIES}
         for x in sub:
@@ -1086,7 +1445,10 @@ def main() -> None:
     }
 
     OUTPUT_JSON.parent.mkdir(parents=True, exist_ok=True)
-    OUTPUT_JSON.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    compact_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    OUTPUT_JSON.write_text(compact_json, encoding="utf-8")
+    if sync_html:
+        sync_payload_to_html(compact_json)
     print(
         f"[DONE] Saved {len(items)} companies ({listed_twse} 上市 + {listed_tpex} 上櫃 = {listed_total} 上市櫃) "
         f"across {payload['meta']['counties_covered']} counties -> {OUTPUT_JSON}"
