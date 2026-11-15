@@ -1473,6 +1473,38 @@
   #search-input::-webkit-search-cancel-button { -webkit-appearance: none; appearance: none; }
   .sr-empty, .sr-more { font-size: 11px; color: var(--ink3); padding: 8px 9px; }
 
+  /* ---------- Share toast ---------- */
+  #toast {
+    position: fixed; left: 50%; bottom: 84px; z-index: 60; transform: translate(-50%, 12px);
+    background: rgba(11, 15, 25, 0.95); border: 1px solid rgba(56, 189, 248, 0.45); color: var(--ink);
+    border-radius: 999px; padding: 8px 16px; font-size: 12.5px; opacity: 0; pointer-events: none;
+    transition: opacity 0.2s ease, transform 0.2s ease; max-width: calc(100vw - 32px);
+  }
+  #toast.show { opacity: 1; transform: translate(-50%, 0); }
+  #toast input { width: min(420px, 70vw); margin-top: 6px; font: inherit; font-size: 11px; color: var(--ink2); background: rgba(6, 8, 13, 0.7); border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; }
+  #toast.manual { pointer-events: auto; border-radius: 12px; }
+
+  /* ---------- Onboarding coach marks ---------- */
+  #coach { position: fixed; inset: 0; z-index: 70; display: none; }
+  #coach.open { display: block; }
+  #coach-ring {
+    position: fixed; border-radius: 12px; border: 2px solid var(--cyan);
+    box-shadow: 0 0 0 9999px rgba(2, 4, 8, 0.62), 0 0 24px rgba(56, 189, 248, 0.45);
+    transition: all 0.3s cubic-bezier(0.22, 1, 0.36, 1); pointer-events: none;
+  }
+  #coach-ring.center { left: 50% !important; top: 50% !important; width: 0 !important; height: 0 !important; border: 0; }
+  #coach-card {
+    position: fixed; width: min(320px, calc(100vw - 24px)); background: rgba(11, 15, 25, 0.97);
+    border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 14px; padding: 14px 16px 12px;
+    box-shadow: 0 18px 40px rgba(0, 0, 0, 0.6); transition: top 0.3s ease, left 0.3s ease;
+  }
+  .coach-step { font-size: 11px; color: var(--cyan); letter-spacing: 0.12em; }
+  .coach-title { font-size: 15px; font-weight: 700; color: var(--ink); margin: 5px 0 6px; }
+  .coach-body { font-size: 12.5px; color: var(--ink2); line-height: 1.65; }
+  .coach-actions { display: flex; justify-content: space-between; align-items: center; margin-top: 12px; }
+  .coach-actions .tool-btn.primary { background: rgba(56, 189, 248, 0.22); border-color: rgba(56, 189, 248, 0.55); color: #fff; }
+  #coach-skip { background: none; border: 0; color: var(--ink3); font: inherit; font-size: 12px; cursor: pointer; }
+
   /* ---------- Mobile: map-first, panels as bottom sheets ---------- */
   #mobile-report-btn { display: none; }
   @media (max-width: 780px) {
@@ -1500,6 +1532,23 @@
 </style>
 </head>
 <body>
+
+<div id="toast" role="status" aria-live="polite"></div>
+<div id="coach" role="dialog" aria-modal="true" aria-label="使用導覽">
+  <div id="coach-ring"></div>
+  <div id="coach-card">
+    <div class="coach-step" id="coach-step"></div>
+    <div class="coach-title" id="coach-title"></div>
+    <div class="coach-body" id="coach-body"></div>
+    <div class="coach-actions">
+      <button type="button" id="coach-skip">略過</button>
+      <div style="display:flex;gap:6px">
+        <button type="button" class="tool-btn" id="coach-prev">上一步</button>
+        <button type="button" class="tool-btn primary" id="coach-next">下一步</button>
+      </div>
+    </div>
+  </div>
+</div>
 
 <div id="boot-loader" role="status" aria-live="polite">
   <div class="boot-box">
@@ -1563,6 +1612,8 @@
     <button class="tool-btn" id="tilt-btn">Tilt-Shift</button>
     <button class="tool-btn" id="tour-btn">巡航導覽</button>
     <button class="tool-btn" id="reset-btn">重置</button>
+    <button class="tool-btn" id="share-btn" title="複製目前視角的連結（聚落、維度、圖層、選取的公司）">🔗 分享</button>
+    <button class="tool-btn" id="help-btn" title="使用說明" aria-label="使用說明">？</button>
   </div>
 </header>
 
@@ -2364,6 +2415,7 @@ window.__startGcisApp = () => {
     return c.county === countyName;
   }
 
+  let layerUISync = () => {};
   function layersPartial() {
     return !(state.layers.listed && state.layers.base && state.layers.mfg);
   }
@@ -2482,6 +2534,170 @@ window.__startGcisApp = () => {
     if (triggerCamera) {
       triggerSmartFlyTo(matchedSubset);
     }
+    writeViewHash();
+  }
+
+  // =========================================================================
+  // SHAREABLE VIEW LINK (#c=…&m=…&ban=…)
+  // =========================================================================
+  const LAYER_CODES = { listed: 'l', base: 'b', mfg: 'm' };
+  let restoringHash = false;
+  function viewHashString() {
+    const p = new URLSearchParams();
+    if (state.clusterId !== 'all') p.set('c', state.clusterId);
+    if (state.countyFilter) p.set('cty', state.countyFilter);
+    if (state.mode !== 'map') p.set('m', state.mode);
+    if (state.industryFilter >= 0) p.set('ind', String(state.industryFilter));
+    if (state.sicFilter) p.set('sic', state.sicFilter);
+    if (state.onlyListed) p.set('listed', '1');
+    if (layersPartial()) p.set('layers', Object.keys(LAYER_CODES).filter(k => state.layers[k]).map(k => LAYER_CODES[k]).join(''));
+    const selCo = state.selectedBan ? COMPANIES.find(x => x.ban === state.selectedBan) : null;
+    const q = state.searchQuery.trim();
+    if (q && !(selCo && q === selCo.name)) p.set('q', q); // a picked search result is already encoded by ban
+    if (state.selectedBan) p.set('ban', state.selectedBan);
+    return p.toString();
+  }
+  function writeViewHash() {
+    if (restoringHash) return;
+    const h = viewHashString();
+    const cur = location.hash.replace(/^#/, '');
+    if (h === cur) return;
+    try { history.replaceState(null, '', h ? `#${h}` : location.pathname + location.search); } catch (e) { /* sandboxed */ }
+  }
+  // Returns true when the hash carried a view and it was applied.
+  function applyViewHash() {
+    const raw = location.hash.replace(/^#/, '');
+    if (!raw) return false;
+    const p = new URLSearchParams(raw);
+    restoringHash = true;
+    const cid = p.get('c');
+    state.clusterId = CLUSTERS.some(x => x.id === cid) ? cid : 'all';
+    const cty = p.get('cty');
+    state.countyFilter = (cty && COUNTY_CENTERS[cty]) ? cty : '';
+    if (state.countyFilter) state.clusterId = 'all';
+    const m = p.get('m');
+    state.mode = ['map', 'industry', 'capital', 'age'].includes(m) ? m : 'map';
+    state.sliceFilter = -1;
+    const ind = Number(p.get('ind'));
+    state.industryFilter = (p.has('ind') && Number.isInteger(ind) && ind >= 0 && ind < INDUSTRIES.length) ? ind : -1;
+    const sic = p.get('sic');
+    state.sicFilter = (sic && MFG_SIC_LABELS[sic]) ? sic : '';
+    state.onlyListed = p.get('listed') === '1';
+    const lay = p.get('layers');
+    Object.entries(LAYER_CODES).forEach(([k, code]) => { state.layers[k] = lay ? lay.includes(code) : true; });
+    if (!Object.values(state.layers).some(Boolean)) state.layers.listed = true;
+    state.searchQuery = p.get('q') || '';
+    const ban = p.get('ban');
+    const sel = ban ? COMPANIES.find(x => x.ban === ban && state.layers[x._layer]) : null;
+    state.selectedBan = null;
+    document.getElementById('company-card').classList.remove('open');
+    syncToolbarAndDockFromState();
+    layerUISync();
+    applyTargetsAndUI(true);
+    restoringHash = false;
+    if (sel) setTimeout(() => selectCompany(sel, true), 1300);
+    else writeViewHash();
+    return true;
+  }
+
+  let toastTimer = null;
+  function showToast(html, manual = false, ms = 2200) {
+    const t = document.getElementById('toast');
+    t.innerHTML = html;
+    t.classList.toggle('manual', manual);
+    t.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => t.classList.remove('show'), ms);
+  }
+  async function shareView() {
+    writeViewHash();
+    const url = location.href;
+    try {
+      await navigator.clipboard.writeText(url);
+      showToast('🔗 已複製目前視角的連結');
+    } catch (e) {
+      // Clipboard blocked (http, iframe): show the link to copy by hand
+      showToast('長按或 Ctrl+C 複製連結：<br><input id="toast-url" readonly>', true, 9000);
+      const inp = document.getElementById('toast-url');
+      inp.value = url;
+      inp.focus();
+      inp.select();
+    }
+  }
+
+  // =========================================================================
+  // FIRST-VISIT ONBOARDING (3 coach marks; replay with ？)
+  // =========================================================================
+  const ONBOARD_KEY = 'gcis3d.onboarded.v1';
+  function onboardSteps() {
+    const isMobile = window.matchMedia('(max-width: 780px)').matches;
+    return [
+      { target: null, title: '歡迎使用全臺產業・股價 3D',
+        body: isMobile
+          ? '每個光點是一家公司，光柱越高代表實收資本額越大。<br>單指拖曳旋轉、雙指縮放；底部按鈕可飛到各產業聚落。'
+          : '每個光點是一家公司，光柱越高代表實收資本額越大。<br>左鍵拖曳旋轉、右鍵平移、滾輪縮放；底部按鈕可飛到各產業聚落。' },
+      { target: '.mode-tabs', title: '切換 4 種維度',
+        body: '聚落看地理分布；產業、資本、世代會把公司分層堆疊，一眼比較結構。' },
+      { target: '.tools-bar', title: '搜尋與資料圖層',
+        body: '輸入公司名稱、股票代號或統編，按 Enter 直接飛過去。<br>🧩 圖層可切換資料來源；🔗 分享可複製目前視角的連結。' },
+      { target: '#ai-dock', title: '問 AI 導演',
+        body: '用一句話提問，例如「竹科半導體雙雄」，它會自動切換維度、飛越並彈出公司卡。<br>不設定 Key 也能用本機分鏡。' },
+    ];
+  }
+  function initOnboarding() {
+    const coach = document.getElementById('coach');
+    const ring = document.getElementById('coach-ring');
+    const card = document.getElementById('coach-card');
+    const prev = document.getElementById('coach-prev');
+    const next = document.getElementById('coach-next');
+    let steps = [];
+    let idx = 0;
+    function place() {
+      const st = steps[idx];
+      document.getElementById('coach-step').textContent = `${idx + 1} / ${steps.length}`;
+      document.getElementById('coach-title').textContent = st.title;
+      document.getElementById('coach-body').innerHTML = st.body;
+      prev.style.visibility = idx === 0 ? 'hidden' : 'visible';
+      next.textContent = idx === steps.length - 1 ? '開始使用' : '下一步';
+      const el = st.target && document.querySelector(st.target);
+      const r = el && el.getBoundingClientRect();
+      const cw = card.offsetWidth, chh = card.offsetHeight, W = window.innerWidth, H = window.innerHeight;
+      if (!r || !r.width) {
+        ring.classList.add('center');
+        card.style.left = `${Math.round((W - cw) / 2)}px`;
+        card.style.top = `${Math.round((H - chh) / 2)}px`;
+        return;
+      }
+      ring.classList.remove('center');
+      const pad = 6;
+      Object.assign(ring.style, { left: `${r.left - pad}px`, top: `${r.top - pad}px`, width: `${r.width + pad * 2}px`, height: `${r.height + pad * 2}px` });
+      let top = r.bottom + 14;
+      if (top + chh > H - 10) top = Math.max(10, r.top - chh - 14);
+      let left = r.left + r.width / 2 - cw / 2;
+      left = Math.max(10, Math.min(W - cw - 10, left));
+      card.style.left = `${Math.round(left)}px`;
+      card.style.top = `${Math.round(top)}px`;
+    }
+    function close() {
+      coach.classList.remove('open');
+      try { localStorage.setItem(ONBOARD_KEY, '1'); } catch (e) { /* storage unavailable */ }
+    }
+    function open() {
+      steps = onboardSteps();
+      idx = 0;
+      coach.classList.add('open');
+      place();
+    }
+    prev.addEventListener('click', () => { if (idx > 0) { idx--; place(); } });
+    next.addEventListener('click', () => { if (idx < steps.length - 1) { idx++; place(); } else close(); });
+    document.getElementById('coach-skip').addEventListener('click', close);
+    coach.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
+    window.addEventListener('resize', () => { if (coach.classList.contains('open')) place(); });
+    document.getElementById('help-btn').addEventListener('click', open);
+    let seen = false;
+    try { seen = localStorage.getItem(ONBOARD_KEY) === '1'; } catch (e) { seen = true; }
+    // Visitors who arrive through a shared link go straight to the shared view
+    if (!seen && !location.hash) setTimeout(open, 700);
   }
 
   function triggerSmartFlyTo(matchedSubset) {
@@ -3204,6 +3420,7 @@ window.__startGcisApp = () => {
     layerBoxes.forEach(b => b.addEventListener('change', () => setLayers({ [b.dataset.layer]: b.checked })));
     document.getElementById('layer-compare').addEventListener('click', () => setLayers({ listed: true, base: true, mfg: false }));
     document.getElementById('layer-all').addEventListener('click', () => setLayers({ listed: true, base: true, mfg: true }));
+    layerUISync = syncLayerUI;
     syncLayerUI();
 
     // Top Tools
@@ -3228,6 +3445,8 @@ window.__startGcisApp = () => {
       document.getElementById('company-card').classList.remove('open');
       applyTargetsAndUI(false);
     });
+    document.getElementById('share-btn').addEventListener('click', shareView);
+    window.addEventListener('hashchange', () => { if (location.hash.replace(/^#/, '') !== viewHashString()) applyViewHash(); });
     document.getElementById('tilt-btn').addEventListener('click', (e) => {
       document.body.classList.toggle('tilt-on');
       e.target.classList.toggle('on', document.body.classList.contains('tilt-on'));
@@ -3249,6 +3468,8 @@ window.__startGcisApp = () => {
       cSel.value = '';
       const sicSelR = document.getElementById('sic-select');
       if (sicSelR) sicSelR.value = '';
+      Object.assign(state.layers, { listed: true, base: true, mfg: true });
+      layerUISync();
       updateClusterChipUI();
       applyTargetsAndUI(true);
     });
@@ -4580,7 +4801,8 @@ window.__startGcisApp = () => {
 
   // Boot Sequence
   initUI();
-  applyTargetsAndUI(false);
+  if (!applyViewHash()) applyTargetsAndUI(false);
+  initOnboarding();
   requestAnimationFrame(animate);
 };
 </script>
