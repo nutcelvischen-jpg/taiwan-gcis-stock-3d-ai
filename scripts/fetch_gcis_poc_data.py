@@ -29,8 +29,8 @@ from typing import Any
 WORKSPACE = Path(__file__).resolve().parent.parent
 GEO_MAPS_JS = WORKSPACE / "js" / "universal_geo_maps.js"
 OUTPUT_JSON = WORKSPACE / "sample_data" / "gcis_industry_poc_data.json"
-POC_HTML = WORKSPACE / "gcis_industry_3d_poc.html"
 INDEX_HTML = WORKSPACE / "index.html"
+WEB_DATA_JS = WORKSPACE / "data" / "gcis_data.js"
 
 # Verified GCIS Open Data API endpoints
 OID_CAPITAL = "F0E8FB8D-E2FD-472E-886C-91C673641F31"
@@ -663,8 +663,8 @@ CLUSTERS: list[dict[str, Any]] = [
         "en": "ALL TAIWAN",
         "center": [120.92, 23.75],
         "cam": {"yaw": -0.35, "pitch": 0.62, "zoom": 1.0},
-        "tagline": "經濟部 GCIS × 登記工廠名錄 × TWSE & TPEx 台股即時行情",
-        "narrative": "串聯經濟部實測商工登記、全台中部生產中製造業工廠與全臺上市櫃即時交易行情，呈現北部「金融與IC設計研發」、竹苗「半導體護國神山群」、中部「中彰投金屬電機、精密機械與傳統製造聚落」、南科「先進製程與綠能」至高雄「亞灣智慧港灣與封測S廊帶」的立體產業地圖。",
+        "tagline": "經濟部 GCIS × 登記工廠名錄 × TWSE & TPEx 台股行情",
+        "narrative": "串聯經濟部實測商工登記、全台中部生產中製造業工廠與全臺上市櫃每日交易行情，呈現北部「金融與IC設計研發」、竹苗「半導體護國神山群」、中部「中彰投金屬電機、精密機械與傳統製造聚落」、南科「先進製程與綠能」至高雄「亞灣智慧港灣與封測S廊帶」的立體產業地圖。",
         "highlights": ["GCIS×工廠名錄×TWSE", "中部金屬電機大聚落", "竹科半導體心臟", "AI 3D對話導覽", "8大聚落座標"],
     },
     {
@@ -783,7 +783,7 @@ def load_taiwan_geojson() -> dict[str, Any]:
         m = re.search(r"const TAIWAN_GEOJSON\s*=\s*(\{.*?\});", text, re.S)
         if m:
             return json.loads(m.group(1))
-    for html_path in (POC_HTML, INDEX_HTML):
+    for html_path in (INDEX_HTML,):
         if html_path.exists():
             text = html_path.read_text(encoding="utf-8")
             m = re.search(r"window\.__TAIWAN_GEOJSON__\s*=\s*(\{.*?\});", text)
@@ -1721,20 +1721,75 @@ def pack_payload_for_html(payload: dict[str, Any]) -> str:
     return json.dumps(packed_payload, ensure_ascii=False, separators=(",", ":"))
 
 
+# Fields stored as dictionary indexes (repeated strings) and as index lists (sparse booleans)
+_WEB_DICT_FIELDS = ("county", "district", "reg_org", "cluster")
+_WEB_FLAG_FIELDS = ("flagship", "cap_est")
+
+
+def pack_payload_columnar(payload: dict[str, Any]) -> dict[str, Any]:
+    """Column-oriented packing of the HTML payload (~45% smaller than row objects).
+
+    index.html decodes it back to the row schema produced by pack_payload_for_html()."""
+    rows = json.loads(pack_payload_for_html(payload))["companies"]
+    keys: list[str] = []
+    for r in rows:
+        for k in r:
+            if k not in keys:
+                keys.append(k)
+    cols: dict[str, Any] = {}
+    dicts: dict[str, list[Any]] = {}
+    flags: dict[str, list[int]] = {}
+    for k in keys:
+        vals = [r.get(k) for r in rows]
+        if k in _WEB_FLAG_FIELDS:
+            flags[k] = [i for i, v in enumerate(vals) if v]
+        elif k in _WEB_DICT_FIELDS:
+            table: list[Any] = []
+            index: dict[Any, int] = {}
+            out: list[int] = []
+            for v in vals:
+                if v is None:
+                    out.append(-1)
+                    continue
+                if v not in index:
+                    index[v] = len(table)
+                    table.append(v)
+                out.append(index[v])
+            dicts[k] = table
+            cols[k] = out
+        else:
+            cols[k] = vals
+    return {
+        "format": "gcis-columnar-v1",
+        "meta": payload["meta"],
+        "industries": payload["industries"],
+        "clusters": payload["clusters"],
+        "n": len(rows),
+        "cols": cols,
+        "dicts": dicts,
+        "flags": flags,
+    }
+
+
 def sync_payload_to_html(payload: dict[str, Any]) -> None:
-    packed_json = pack_payload_for_html(payload)
-    pattern = re.compile(r"^window\.__GCIS_DATA__\s*=\s*\{.*?\};[ \t]*$", re.MULTILINE)
-    replacement = f"window.__GCIS_DATA__ = {packed_json};"
-    for html_path in (POC_HTML, INDEX_HTML):
-        if not html_path.exists():
-            continue
-        text = html_path.read_text(encoding="utf-8")
-        if not pattern.search(text):
-            continue
-        new_text, count = pattern.subn(lambda _: replacement, text, count=1)
-        if count:
-            html_path.write_text(new_text, encoding="utf-8")
-            print(f"[SYNC] Updated window.__GCIS_DATA__ in {html_path} ({len(packed_json)/1e6:.2f} MB payload)")
+    """Write data/gcis_data.js (loaded lazily by index.html) and bump its cache-busting version."""
+    packed_json = json.dumps(pack_payload_columnar(payload), ensure_ascii=False, separators=(",", ":"))
+    body = f"window.__GCIS_PACKED__={packed_json};\n".encode("utf-8")
+    WEB_DATA_JS.parent.mkdir(parents=True, exist_ok=True)
+    WEB_DATA_JS.write_bytes(body)
+    version = hashlib.sha1(body).hexdigest()[:10]
+    src_line = (
+        f"window.__GCIS_DATA_SRC__ = {{ url: 'data/gcis_data.js?v={version}', bytes: {len(body)} }};"
+    )
+    pattern = re.compile(r"^window\.__GCIS_DATA_SRC__\s*=\s*\{.*?\};[ \t]*$", re.MULTILINE)
+    text = INDEX_HTML.read_text(encoding="utf-8")
+    new_text, count = pattern.subn(lambda _: src_line, text, count=1)
+    if count:
+        INDEX_HTML.write_text(new_text, encoding="utf-8")
+    print(
+        f"[SYNC] Wrote {WEB_DATA_JS} ({len(body)/1e6:.2f} MB, v={version})"
+        + ("" if count else " — WARNING: window.__GCIS_DATA_SRC__ line not found in index.html")
+    )
 
 
 def main() -> None:
@@ -1742,6 +1797,10 @@ def main() -> None:
     refresh_central = "--refresh-central" in sys.argv
     skip_central = "--skip-central" in sys.argv
     sync_html = "--sync-html" in sys.argv
+    if "--pack-only" in sys.argv:
+        # Rebuild data/gcis_data.js from the saved JSON without hitting any API
+        sync_payload_to_html(json.loads(OUTPUT_JSON.read_text(encoding="utf-8")))
+        return
     geojson = load_taiwan_geojson()
     county_polys = build_county_poly_index(geojson)
     raw_records, verified_flagships = load_or_collect_gcis_records(force_refresh=force_refresh)
