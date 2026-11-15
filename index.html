@@ -1509,7 +1509,12 @@
   #mobile-report-btn { display: none; }
   @media (max-width: 780px) {
     .tools-bar { max-width: 100%; overflow-x: auto; scrollbar-width: none; }
-    #tilt-btn, #tour-btn { display: none; }
+    /* Phone toolbar must fit 390px: drop desktop-only tools, icon-only reset/share */
+    #tilt-btn, #tour-btn, #open-api-btn { display: none; }
+    .tb-lbl { display: none; }
+    #search-input { width: 108px; }
+    #search-input:focus { width: 128px; }
+    .tools-bar { gap: 4px; }
     #search-results, #layer-pop { left: 10px !important; right: 10px !important; width: auto; }
     #briefing-panel {
       top: auto !important; bottom: 66px; left: 10px; right: 10px; width: auto;
@@ -1611,8 +1616,8 @@
     <button class="tool-btn api-btn" id="open-api-btn">⚡ GCIS API</button>
     <button class="tool-btn" id="tilt-btn">Tilt-Shift</button>
     <button class="tool-btn" id="tour-btn">巡航導覽</button>
-    <button class="tool-btn" id="reset-btn">重置</button>
-    <button class="tool-btn" id="share-btn" title="複製目前視角的連結（聚落、維度、圖層、選取的公司）">🔗 分享</button>
+    <button class="tool-btn" id="reset-btn" aria-label="重置">↺<span class="tb-lbl"> 重置</span></button>
+    <button class="tool-btn" id="share-btn" title="複製目前視角的連結（聚落、維度、圖層、選取的公司）" aria-label="分享目前視角">🔗<span class="tb-lbl"> 分享</span></button>
     <button class="tool-btn" id="help-btn" title="使用說明" aria-label="使用說明">？</button>
   </div>
 </header>
